@@ -49,7 +49,7 @@ sma_poc/
       shiftable/
         shiftable_specialists.pt
   shiftable_attention/
-    # your existing package from Archive.zip (must be importable as `shiftable_attention`)
+    # GRCLM Implementation 
 ```
 
 > Note: When you start the API **for the first time**, the outputs in
@@ -75,7 +75,7 @@ This folder contains the core modeling and data utilities:
 
 ### 2.2 shiftable_attention
 
-Your existing package (from `Archive.zip`) that defines `ShiftableTransformerBlock`
+Additional package that defines `ShiftableTransformerBlock`
 and the underlying shiftable attention logic. This is imported as:
 
 ```python
