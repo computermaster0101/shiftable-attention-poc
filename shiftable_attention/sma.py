@@ -1,0 +1,191 @@
+from typing import Optional, List
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+from .gate import DomainGate
+
+
+class ShiftableMultiheadAttention(nn.Module):
+    """
+    Shiftable Modular Attention (SMA).
+
+    Combines:
+      - a frozen base MultiheadAttention
+      - one or more trainable specialist MultiheadAttention modules
+      - a trainable DomainGate to weight domains
+
+    For D specialists:
+        num_domains = 1 + D
+        domain 0: base
+        domain i>0: specialist i-1
+
+    Output:
+        Y = sum_d g_d(X) * MHA_d(X)
+    where g_d(X) are gate weights for each domain.
+
+    Args:
+        d_model: hidden size.
+        num_heads: number of attention heads.
+        base_mha: a pre-trained nn.MultiheadAttention module.
+        num_specialists: number of specialist branches.
+        dropout: attention dropout.
+        use_cls_token_pool: if True, pool using first token; else mean over sequence.
+    """
+    def __init__(
+        self,
+        d_model: int,
+        num_heads: int,
+        base_mha: nn.MultiheadAttention,
+        num_specialists: int = 1,
+        dropout: float = 0.0,
+        use_cls_token_pool: bool = False,
+    ):
+        super().__init__()
+
+        assert d_model % num_heads == 0, "d_model must be divisible by num_heads"
+        assert num_specialists >= 0, "num_specialists must be >= 0"
+
+        self.d_model = d_model
+        self.num_heads = num_heads
+        self.num_specialists = num_specialists
+        self.use_cls_token_pool = use_cls_token_pool
+
+        # Store and freeze base MHA
+        self.base_mha = base_mha
+        for p in self.base_mha.parameters():
+            p.requires_grad = False
+
+        # Ensure we know whether the base module expects batch_first
+        self.base_batch_first = getattr(self.base_mha, "batch_first", False)
+
+        # Specialist MHA modules
+        self.specialist_mhas = nn.ModuleList([
+            nn.MultiheadAttention(
+                embed_dim=d_model,
+                num_heads=num_heads,
+                dropout=dropout,
+                batch_first=True,  # we use [batch, seq, d_model]
+            )
+            for _ in range(num_specialists)
+        ])
+
+        # Domain gate: 1 base + N specialist branches
+        num_domains = 1 + num_specialists
+        self.gate = DomainGate(d_model=d_model, num_domains=num_domains)
+
+    def pool_hidden(self, x: torch.Tensor) -> torch.Tensor:
+        """
+        Pool hidden states across sequence dimension.
+
+        Args:
+            x: [batch, seq_len, d_model]
+
+        Returns:
+            [batch, d_model]
+        """
+        if self.use_cls_token_pool:
+            # assume first token is CLS-like
+            return x[:, 0, :]
+        else:
+            # mean pooling across sequence
+            return x.mean(dim=1)
+
+    def _run_base_mha(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> torch.Tensor:
+        """
+        Run the frozen base MHA with no gradients.
+        """
+        with torch.no_grad():
+            if self.base_batch_first:
+                base_out, _ = self.base_mha(
+                    x, x, x,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+            else:
+                # convert to [seq, batch, d_model]
+                x_t = x.transpose(0, 1)
+                base_out_t, _ = self.base_mha(
+                    x_t, x_t, x_t,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+                base_out = base_out_t.transpose(0, 1)
+        return base_out
+
+    def _run_specialists(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor],
+        key_padding_mask: Optional[torch.Tensor],
+    ) -> List[torch.Tensor]:
+        """
+        Run all specialist MHA modules.
+
+        Returns:
+            List of [batch, seq, d_model], one per specialist.
+        """
+        outs: List[torch.Tensor] = []
+        for spec_mha in self.specialist_mhas:
+            out, _ = spec_mha(
+                x, x, x,
+                attn_mask=attn_mask,
+                key_padding_mask=key_padding_mask,
+                need_weights=False,
+            )
+            outs.append(out)
+        return outs
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: Optional[torch.Tensor] = None,
+        key_padding_mask: Optional[torch.Tensor] = None,
+        return_gate: bool = False,
+    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+        """
+        Args:
+            x: [batch, seq_len, d_model]
+            attn_mask: optional attention mask.
+            key_padding_mask: [batch, seq_len] mask for padding positions.
+            return_gate: whether to return gate weights.
+
+        Returns:
+            y: [batch, seq_len, d_model]
+            gate_probs (optional): [batch, num_domains]
+        """
+        bsz, _, _ = x.size()
+
+        # 1) Base output
+        base_out = self._run_base_mha(x, attn_mask, key_padding_mask)  # [b, s, d]
+
+        # 2) Specialist outputs
+        spec_outs = self._run_specialists(x, attn_mask, key_padding_mask)  # list of [b, s, d]
+
+        # 3) Compute gate weights over domains
+        pooled = self.pool_hidden(x)               # [b, d]
+        logits = self.gate(pooled)                 # [b, 1 + num_specialists]
+        gate = F.softmax(logits, dim=-1)           # [b, 1 + num_specialists]
+
+        # Split gate weights
+        g_base = gate[:, 0].view(bsz, 1, 1)        # [b, 1, 1]
+        g_specs = gate[:, 1:]                      # [b, num_specialists]
+
+        # 4) Blend outputs (attention shift)
+        y = g_base * base_out                      # [b, s, d]
+        for i, spec_out in enumerate(spec_outs):
+            g_i = g_specs[:, i].view(bsz, 1, 1)    # [b, 1, 1]
+            y = y + g_i * spec_out
+
+        if return_gate:
+            return y, gate
+        else:
+            return y, None

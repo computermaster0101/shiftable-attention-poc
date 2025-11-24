@@ -1,0 +1,19 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "shiftable-attention"
+version = "0.1.0"
+description = "Shiftable Modular Attention: attach specialist attention to a frozen base transformer."
+authors = [
+  { name = "Your Name", email = "you@example.com" }
+]
+readme = "README.md"
+requires-python = ">=3.9"
+dependencies = [
+  "torch>=2.0.0",
+]
+
+[project.urls]
+Homepage = "https://github.com/yourname/shiftable-attention"
