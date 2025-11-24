@@ -255,12 +255,6 @@ Base model is *never touched*.
 
 ---
 
-# 📄 License
-
-MIT License © 2025 Your Name
-
----
-
 # 🙌 Contributions
 
 PRs welcome.  
