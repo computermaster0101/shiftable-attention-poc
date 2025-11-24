@@ -1,0 +1,51 @@
+ID,Area,Summary,Notes / What it Confirms,Heavy?
+SAFE-01,Safety / Prep,Add env toggle to disable auto-init,`SMA_DISABLE_AUTO_INIT` or similar gating `ensure_initialized()` on startup,No
+SAFE-02,Safety / Prep,Tiny test config,"Separate “test” hyperparams + tiny corpora for quick, deterministic runs",No
+ENV-01,Environment,Python + deps sanity,"`torch`, `fastapi`, `pydantic`, etc. install & import cleanly",No
+ENV-02,Environment,Project path assumptions,All root paths / config paths resolve correctly,No
+ENV-03,Environment,Data directory presence,Expected data dirs (general + specialists) and output dirs exist,No
+ENV-04,Environment,GPU / CPU capability,`torch.cuda.is_available()` and memory sufficient for intended device,No
+ST-01,Static / Structure,Importability of key modules,"`app.api`, `app.model_manager`, `app.router`, `shiftable_attention.sma`, etc. import OK",No
+ST-02,Static / Structure,Linting,Run `ruff`/`flake8` to catch obvious code smells,No
+ST-03,Static / Structure,Type checking,Run `mypy` (or similar) over app/core modules,No
+ST-04,Static / Structure,Config validation,"Hyperparams/path values are valid (ranges, existence)",No
+SA-01,Shiftable Attention,SMA shape sanity,"Forward pass on random batch; shapes match, no NaNs",No
+SA-02,Shiftable Attention,DomainGate behavior,Gating weights sum to 1; correct domain wins for simple cases,No
+SA-03,Shiftable Attention,Block wiring,"Minimal Shiftable Transformer block runs forward, shapes consistent",No
+SA-04,Shiftable Attention,No-specialist mode,SMA behaves like standard MHA when no specialists,No
+SP-01,Shiftable Project,Tokenizer round-trip,Encode/decode simple text; round-trip is sane,No
+SP-02,Shiftable Project,Dataset + DataLoader,Sequences padded/truncated correctly; batch shapes/dtypes good,No
+SP-03,Shiftable Project,Model forward pass (no training),Base LM forward on a small batch succeeds; logits / loss shapes correct,No*
+SP-04,Shiftable Project,Train script arg parsing,`train_generalist.py` & `train_specialists.py` parse CLI and build configs without loop,No
+RT-01,Domain Router,Stats file loading,"`DomainRouter` loads small `domain_stats.json`, dimensions/device correct",No
+RT-02,Domain Router,Distance & probability calc,Closest centroid wins; midpoint embeddings give balanced probs,No
+RT-03,Domain Router,Unknown by distance,Far embeddings correctly flagged unknown via `ROUTER_UNKNOWN_MIN_DIST`,No
+RT-04,Domain Router,Unknown by entropy,High-entropy distribution triggers unknown via `ROUTER_UNKNOWN_MAX_ENTROPY`,No
+RT-05,Domain Router,Unknown by support,Low-support domains get treated as unknown via `ROUTER_UNKNOWN_MIN_SUPPORT`,No
+MM-01,Model Manager,Initial status,"`get_status()` before init → `initialized=False`, empty paths/lists",No
+MM-02,Model Manager,Locking / reentrancy,Safe multi-threaded access to non-training methods,No
+MM-03,Model Manager,Specialist metadata only,Add/remove specialist names in metadata layer without touching checkpoints,No
+MM-04,Model Manager,Unknown embedding buffer,"In-memory emergent buffer behaves as intended (thresholding, accumulation)",No
+MM-10,Model Manager,Generalist training pipeline,"`_train_generalist()` writes a generalist ckpt + tokenizer, reloadable",Yes
+MM-11,Model Manager,Shiftable training pipeline,`_train_shiftable_model()` writes shiftable ckpt + domain stats; router loads fine,Yes
+MM-12,Model Manager,ensure_initialized first run,"In clean state, trains generalist + shiftable and sets `initialized=True`",Yes
+MM-13,Model Manager,ensure_initialized idempotency,"With existing checkpoints, `ensure_initialized()` just loads, doesn’t retrain",Yes
+API-01,API (FastAPI),Root serves frontend,GET `/` → serves `index.html` with status `200`,No
+API-02,API (FastAPI),/health endpoint,Returns expected status fields (with stubbed model_manager),No
+API-03,API (FastAPI),/generate validation only,Request validation & error codes OK using stubbed `generate()`,No
+API-04,API (FastAPI),GET /specialists,Returns JSON list of specialists (stubbed backend),No
+API-05,API (FastAPI),POST /specialists,Validates input; updates stubbed list; correct response schema & status codes,No
+API-06,API (FastAPI),DELETE /specialists/{name},Correct codes for existing vs missing specialists; validation works,No
+API-07,API (FastAPI),Error handling,ModelManager exceptions surface as sensible HTTP errors,No
+E2E-01,End-to-End,First-run startup,Starting API in clean state trains everything; `/health` shows healthy initialized state,Yes
+E2E-02,End-to-End,Cold restart from checkpoints,Restart reuses checkpoints without retraining; `/health` consistent,Yes
+E2E-03,End-to-End,Specialist add/delete lifecycle,Add corpus → retrain → new specialist appears; delete → retrain → removed from routing,Yes
+E2E-04,End-to-End,Generation + domain routing,"Domain-specific outputs differ; `domain=""auto""` routes sensibly",Yes
+E2E-05,End-to-End,Emergent specialist from unknowns,Repeated unknowns trigger emergent specialist creation & integration,Yes
+FE-01,Frontend,Basic UI load,"`index.html` renders correctly, assets load",No
+FE-02,Frontend,Chat interaction (stubbed backend),"Sending message updates UI correctly, handles loading states",No
+FE-03,Frontend,Specialist list & controls,Renders list; add/delete flows work against stub,No
+FE-04,Frontend,Long-running operation UX,"“Retraining” states communicated clearly (simulated), correct buttons disabled",No
+REL-01,Reliability / Failure,Missing data directory,Clear error / health status when `GENERAL_DATA_DIR` missing,No
+REL-02,Reliability / Failure,Corrupted checkpoint / stats,Graceful failure + clear messaging when artifacts are corrupted,No
+REL-03,Reliability / Failure,Low-resource behaviour,Reasonable OOM / resource errors instead of silent failures,Possibly

@@ -1,0 +1,490 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Shiftable Multi-Agent PoC</title>
+  <style>
+    * {
+      box-sizing: border-box;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+    }
+
+    body {
+      margin: 0;
+      padding: 0;
+      background-color: #111827;
+      color: #e5e7eb;
+      height: 100vh;
+      display: flex;
+      justify-content: center;
+      align-items: stretch;
+    }
+
+    .app-container {
+      display: flex;
+      flex-direction: row;
+      width: 100%;
+      max-width: 1200px;
+      height: 100%;
+      padding: 16px;
+      gap: 16px;
+    }
+
+    .panel {
+      background-color: #020617;
+      border-radius: 12px;
+      padding: 16px;
+      display: flex;
+      flex-direction: column;
+      box-shadow: 0 10px 30px rgba(0, 0, 0, 0.5);
+    }
+
+    .panel.chat {
+      flex: 2;
+    }
+
+    .panel.sidebar {
+      flex: 1;
+      max-width: 360px;
+    }
+
+    h1, h2, h3 {
+      margin: 0 0 8px 0;
+    }
+
+    .subtitle {
+      font-size: 0.85rem;
+      color: #9ca3af;
+      margin-bottom: 8px;
+    }
+
+    .chat-log {
+      flex: 1;
+      background-color: #020617;
+      border-radius: 8px;
+      border: 1px solid #1f2933;
+      padding: 12px;
+      margin-bottom: 12px;
+      overflow-y: auto;
+      font-size: 0.9rem;
+      white-space: pre-wrap;
+    }
+
+    .message {
+      margin-bottom: 10px;
+      padding: 8px;
+      border-radius: 8px;
+    }
+
+    .message.user {
+      background-color: #0f172a;
+      align-self: flex-end;
+    }
+
+    .message.model {
+      background-color: #111827;
+      border: 1px solid #1f2933;
+      align-self: flex-start;
+    }
+
+    .message strong {
+      display: block;
+      margin-bottom: 4px;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: #9ca3af;
+    }
+
+    .chat-input {
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    textarea {
+      width: 100%;
+      min-height: 80px;
+      resize: vertical;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid #374151;
+      background-color: #020617;
+      color: #e5e7eb;
+      font-size: 0.95rem;
+    }
+
+    textarea:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 1px #3b82f6;
+    }
+
+    .button-row {
+      display: flex;
+      gap: 8px;
+      justify-content: flex-end;
+      align-items: center;
+    }
+
+    button {
+      border-radius: 9999px;
+      border: none;
+      padding: 8px 16px;
+      font-size: 0.9rem;
+      cursor: pointer;
+      background: linear-gradient(135deg, #3b82f6, #6366f1);
+      color: white;
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    button.secondary {
+      background: #111827;
+      color: #e5e7eb;
+      border: 1px solid #374151;
+    }
+
+    button.danger {
+      background: #b91c1c;
+    }
+
+    button:disabled {
+      opacity: 0.6;
+      cursor: default;
+    }
+
+    .status-bar {
+      font-size: 0.8rem;
+      color: #9ca3af;
+      margin-top: 4px;
+    }
+
+    .specialists-list {
+      flex: 1;
+      background-color: #020617;
+      border-radius: 8px;
+      border: 1px solid #1f2933;
+      padding: 8px;
+      overflow-y: auto;
+      font-size: 0.9rem;
+    }
+
+    .specialist-item {
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      margin-bottom: 6px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      background-color: #020617;
+      border: 1px solid #1f2933;
+    }
+
+    .specialist-name {
+      font-weight: 500;
+      color: #e5e7eb;
+    }
+
+    .specialist-primary {
+      font-size: 0.8rem;
+      color: #9ca3af;
+    }
+
+    .add-specialist-form {
+      margin-top: 12px;
+      padding: 8px;
+      border-radius: 8px;
+      border: 1px solid #1f2933;
+      background-color: #020617;
+      display: flex;
+      flex-direction: column;
+      gap: 8px;
+    }
+
+    .add-specialist-form input {
+      border-radius: 9999px;
+      border: 1px solid #374151;
+      padding: 6px 10px;
+      background-color: #020617;
+      color: #e5e7eb;
+      font-size: 0.9rem;
+    }
+
+    .add-specialist-form input:focus {
+      outline: none;
+      border-color: #3b82f6;
+      box-shadow: 0 0 0 1px #3b82f6;
+    }
+
+    .hint {
+      font-size: 0.75rem;
+      color: #9ca3af;
+      line-height: 1.4;
+    }
+
+    .tag {
+      display: inline-block;
+      padding: 2px 6px;
+      border-radius: 9999px;
+      font-size: 0.7rem;
+      background-color: #111827;
+      border: 1px solid #1f2933;
+      margin-left: 6px;
+      color: #9ca3af;
+    }
+  </style>
+</head>
+<body>
+  <div class="app-container">
+    <div class="panel chat">
+      <h1>Shiftable Generalist Chat</h1>
+      <div class="subtitle">
+        Backed by a generalist LM plus specialist heads (e.g., <code>datascience</code>, <code>businessadvisor</code>).
+      </div>
+
+      <div id="chatLog" class="chat-log"></div>
+
+      <div class="chat-input">
+        <textarea id="promptInput" placeholder="Ask a question or start a conversation..."></textarea>
+        <div class="button-row">
+          <span class="status-bar" id="chatStatus"></span>
+          <button id="sendBtn" onclick="sendMessage()">
+            <span>Send</span>
+          </button>
+        </div>
+      </div>
+    </div>
+
+    <div class="panel sidebar">
+      <h2>Specialists</h2>
+      <div class="subtitle">
+        Specialists act as domain heads that the generalist can route into.
+      </div>
+      <div id="specialistsList" class="specialists-list"></div>
+
+      <div class="add-specialist-form">
+        <h3>Add Specialist</h3>
+        <input id="newSpecialistName" type="text" placeholder="e.g. marketing" />
+        <div class="hint">
+          1) Create <code>shiftable_project/data/&lt;name&gt;/</code> with <code>.txt</code> corpus.<br />
+          2) Click “Add Specialist” to retrain.
+        </div>
+        <div class="button-row" style="justify-content: flex-start;">
+          <button id="addSpecialistBtn" onclick="addSpecialist()">
+            Add Specialist
+          </button>
+        </div>
+      </div>
+
+      <div class="status-bar" id="sideStatus"></div>
+    </div>
+  </div>
+
+  <script>
+    const chatLogEl = document.getElementById("chatLog");
+    const promptInputEl = document.getElementById("promptInput");
+    const chatStatusEl = document.getElementById("chatStatus");
+    const specialistsListEl = document.getElementById("specialistsList");
+    const sideStatusEl = document.getElementById("sideStatus");
+    const sendBtnEl = document.getElementById("sendBtn");
+    const addSpecialistBtnEl = document.getElementById("addSpecialistBtn");
+    const newSpecialistNameEl = document.getElementById("newSpecialistName");
+
+    let isGenerating = false;
+    let conversationHistory = [];
+
+    function appendMessage(role, text) {
+      const msg = document.createElement("div");
+      msg.classList.add("message");
+      msg.classList.add(role === "user" ? "user" : "model");
+      const strong = document.createElement("strong");
+      strong.textContent = role === "user" ? "You" : "Model";
+      const content = document.createElement("div");
+      content.textContent = text;
+      msg.appendChild(strong);
+      msg.appendChild(content);
+      chatLogEl.appendChild(msg);
+      chatLogEl.scrollTop = chatLogEl.scrollHeight;
+    }
+
+    async function refreshSpecialists() {
+      try {
+        const resp = await fetch("/specialists");
+        if (!resp.ok) {
+          throw new Error("Failed to fetch specialists");
+        }
+        const data = await resp.json();
+        renderSpecialists(data);
+      } catch (err) {
+        sideStatusEl.textContent = "Error loading specialists: " + err.message;
+      }
+    }
+
+    function renderSpecialists(specialists) {
+      specialistsListEl.innerHTML = "";
+      if (!specialists || specialists.length === 0) {
+        const empty = document.createElement("div");
+        empty.textContent = "No specialists found. Create a corpus under shiftable_project/data/<name>/.";
+        empty.style.fontSize = "0.85rem";
+        empty.style.color = "#9ca3af";
+        specialistsListEl.appendChild(empty);
+        return;
+      }
+
+      specialists.forEach((name, idx) => {
+        const row = document.createElement("div");
+        row.classList.add("specialist-item");
+
+        const left = document.createElement("div");
+        const title = document.createElement("div");
+        title.classList.add("specialist-name");
+        title.textContent = name;
+
+        const subtitle = document.createElement("div");
+        subtitle.classList.add("specialist-primary");
+        if (idx === 0) {
+          subtitle.textContent = "First specialist discovered (not special logically, just the first in list).";
+        } else {
+          subtitle.textContent = "Specialist head " + idx;
+        }
+
+        left.appendChild(title);
+        left.appendChild(subtitle);
+
+        const right = document.createElement("div");
+        if (specialists.length > 1) {
+          const btn = document.createElement("button");
+          btn.classList.add("secondary", "danger");
+          btn.textContent = "Delete";
+          btn.onclick = () => deleteSpecialist(name);
+          right.appendChild(btn);
+        } else {
+          const span = document.createElement("span");
+          span.classList.add("tag");
+          span.textContent = "Cannot delete last";
+          right.appendChild(span);
+        }
+
+        row.appendChild(left);
+        row.appendChild(right);
+        specialistsListEl.appendChild(row);
+      });
+    }
+
+    async function sendMessage() {
+      const text = promptInputEl.value.trim();
+      if (!text || isGenerating) return;
+
+      isGenerating = true;
+      sendBtnEl.disabled = true;
+      chatStatusEl.textContent = "Generating...";
+      appendMessage("user", text);
+      promptInputEl.value = "";
+
+      // Simple conversation formatting (all messages in one prompt)
+      conversationHistory.push({ role: "user", content: text });
+      const historyText = conversationHistory.map(m => (m.role === "user" ? "User: " : "Model: ") + m.content).join("\n");
+      const fullPrompt = historyText + "\nModel:";
+
+      try {
+        const resp = await fetch("/generate", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            prompt: fullPrompt,
+            max_new_tokens: 128,
+            temperature: 0.9,
+            top_k: 50
+          })
+        });
+
+        if (!resp.ok) {
+          const errBody = await resp.text();
+          throw new Error(errBody || "Generate request failed");
+        }
+
+        const data = await resp.json();
+        const reply = data.completion || "(no completion)";
+        conversationHistory.push({ role: "model", content: reply });
+        appendMessage("model", reply);
+        chatStatusEl.textContent = "";
+      } catch (err) {
+        appendMessage("model", "Error: " + err.message);
+        chatStatusEl.textContent = "Error during generation.";
+      } finally {
+        isGenerating = false;
+        sendBtnEl.disabled = false;
+      }
+    }
+
+    async function addSpecialist() {
+      const name = newSpecialistNameEl.value.trim();
+      if (!name) {
+        sideStatusEl.textContent = "Enter a specialist name first.";
+        return;
+      }
+      addSpecialistBtnEl.disabled = true;
+      sideStatusEl.textContent = "Adding specialist '" + name + "' (this may retrain the model)...";
+
+      try {
+        const resp = await fetch("/specialists", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ name })
+        });
+
+        if (!resp.ok) {
+          const errBody = await resp.text();
+          throw new Error(errBody || "Add specialist request failed");
+        }
+
+        const data = await resp.json();
+        renderSpecialists(data.specialists);
+        sideStatusEl.textContent = data.message;
+        newSpecialistNameEl.value = "";
+      } catch (err) {
+        sideStatusEl.textContent = "Error: " + err.message;
+      } finally {
+        addSpecialistBtnEl.disabled = false;
+      }
+    }
+
+    async function deleteSpecialist(name) {
+      if (!confirm("Delete specialist '" + name + "'? This also removes its corpus directory.")) {
+        return;
+      }
+      sideStatusEl.textContent = "Deleting specialist '" + name + "' (this may retrain the model)...";
+
+      try {
+        const resp = await fetch("/specialists/" + encodeURIComponent(name), {
+          method: "DELETE"
+        });
+
+        if (!resp.ok) {
+          const errBody = await resp.text();
+          throw new Error(errBody || "Delete specialist request failed");
+        }
+
+        const data = await resp.json();
+        renderSpecialists(data.specialists);
+        sideStatusEl.textContent = data.message;
+      } catch (err) {
+        sideStatusEl.textContent = "Error: " + err.message;
+      }
+    }
+
+    // Enter key to send message (Ctrl+Enter for newline)
+    promptInputEl.addEventListener("keydown", (e) => {
+      if (e.key === "Enter" && !e.shiftKey) {
+        e.preventDefault();
+        sendMessage();
+      }
+    });
+
+    // Initial load
+    refreshSpecialists();
+  </script>
+</body>
+</html>

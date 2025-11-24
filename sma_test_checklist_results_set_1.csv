@@ -1,0 +1,9 @@
+"ID",Area,Summary,Status,Notes
+ENV-01,Environment,Python + deps sanity,Pass,"torch, fastapi, pydantic imported cleanly; baseline runtime deps OK."
+ENV-02,Environment,Project path assumptions,Pass,Project root and config-related paths resolve correctly.
+ENV-03,Environment,Data directory presence,Pass,shiftable_project/data/general exists with corpora; outputs/ not present yet (expected pre-training).
+ST-01,Static / Structure,Importability of key modules,Pass,"Imported shiftable_attention.*, shiftable_project.*, and key app modules without side effects or errors."
+SA-01,Shiftable Attention,SMA shape sanity,Pass,"Forward pass on random batch preserved [batch, seq, d_model]; gate sums ≈ 1; no NaNs."
+SA-04,Shiftable Attention,No-specialist mode,Pass,num_specialists=0 supported; SMA output matches base MHA exactly and gate=[1.0] for the single domain.
+RT-01,Domain Router,Stats file loading,Pass,DomainRouter successfully loaded synthetic domain_stats.json; dim and centroids as expected.
+RT-02,Domain Router,Distance & probability calc,Pass (with caveat),Best-domain ranking correct for each centroid; but current thresholds flag results as unknown_domain.
