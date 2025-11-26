@@ -1,0 +1,425 @@
+
+\documentclass[12pt]{article}
+\usepackage[utf8]{inputenc}
+\usepackage[T1]{fontenc}
+\usepackage{lmodern}
+\usepackage{amsmath,amssymb,amsthm}
+\usepackage{geometry}
+\usepackage{hyperref}
+\usepackage{graphicx}
+\usepackage{tikz}
+\usepackage{booktabs}
+\usepackage{enumitem}
+\usepackage{algorithm}
+\usepackage{algorithmic}
+\usepackage{natbib}
+\usepackage{url}
+\usepackage{xcolor}
+
+\geometry{margin=1in}
+\setlength{\parskip}{0.5em}
+\setlength{\parindent}{0pt}
+
+\title{GRCLM: A Geometric Routing \& Continual Learning Model for Self-Organizing Language Models}
+\author{Michael T.~Herber II}
+\date{November 25th, 2025}
+
+\theoremstyle{definition}
+\newtheorem{definition}{Definition}
+\theoremstyle{plain}
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{lemma}{Lemma}
+\theoremstyle{remark}
+\newtheorem{remark}{Remark}
+
+\begin{document}
+\maketitle
+
+\begin{abstract}
+Large language models (LLMs) have achieved impressive performance across a wide range of tasks, but they are typically trained in a static, offline regime and deployed as fixed artifacts. As a result, they cannot autonomously discover new domains, create new experts, or adapt their internal structure in response to evolving, open-world query distributions. This paper introduces the \emph{Geometric Routing \& Continual Learning Model} (GRCLM), a novel architecture that integrates geometric domain routing, emergent out-of-distribution (OOD) detection, and continual learning into a single self-organizing system.
+
+GRCLM operates in an embedding space endowed with domain-specific centroids and covariance structures. A geometric domain router combines cosine similarity, Mahalanobis distance, predictive entropy, and empirical support ratios into a composite routing score used to select specialist experts or flag queries as belonging to novel domains. Unknown-domain queries are accumulated into emergent clusters; when stability and density criteria are satisfied, GRCLM spawns a new specialist head within a shiftable transformer architecture and triggers a continual learning cycle that updates the shared trunk and recalibrates the domain geometry.
+
+We present a rigorous mathematical formulation of the GRCLM routing equations, domain topology, and emergence conditions, and we analyze key properties of the composite routing function. We formalize the continual learning loop that allows GRCLM to expand its domain taxonomy over time, and we outline experimental protocols for evaluating routing accuracy, emergent domain quality, and stability under domain drift. GRCLM provides a concrete and implementable foundation for lifelong-learning LLMs and distributed cognitive mesh systems.
+\end{abstract}
+
+\section{Introduction}
+
+Large language models (LLMs) such as GPT-style transformers have become a central paradigm in modern artificial intelligence, exhibiting strong performance on language understanding, generation, and reasoning tasks \citep{brown2020language,openai2023gpt4}. Despite their capabilities, mainstream LLMs are fundamentally \emph{static}: they are pretrained on a large corpus, optionally fine-tuned on specific tasks, and then deployed as fixed models. Updating such models requires repeating expensive training procedures and manual curation of new datasets.
+
+In contrast, many real-world environments are \emph{open-world} and \emph{non-stationary}. New domains---such as emerging technologies, policies, or social phenomena---appear continuously. Query distributions shift over time. Rigid, static models fail to adapt gracefully to such evolving contexts.
+
+This motivates the question:
+
+\emph{Can we design an LLM architecture that can (i) recognize when it is operating in a previously unseen domain, (ii) autonomously create new experts for such domains, and (iii) integrate these experts into its behavior through continual learning, all while preserving performance on existing domains?}
+
+To address this question, we propose the \textbf{Geometric Routing \& Continual Learning Model (GRCLM)}. GRCLM combines three core ideas:
+
+\begin{enumerate}[label=(\alph*),noitemsep]
+    \item \textbf{Geometric Domain Routing:} A domain router operates in an embedding space, where each domain is associated with a centroid and covariance matrix. For a query embedding, the router computes similarity, divergence, uncertainty, and empirical support to form a composite routing score.
+    \item \textbf{Emergent Expert Creation:} Queries that cannot be confidently assigned to any existing domain are accumulated into an emergent buffer. Once sufficient evidence is collected and the cluster exhibits low intra-variance, a new domain and specialist head are created.
+    \item \textbf{Continual Learning in a Shiftable Transformer:} The model maintains a shared transformer trunk and domain-specific specialist heads. When a new expert is created, a continual learning cycle refines the trunk and trains the new head, while recalibrating the domain geometry.
+\end{enumerate}
+
+By closing the loop between routing, emergence, and learning, GRCLM behaves as a \emph{self-organizing expert system} capable of growing its internal domain taxonomy over time. This architecture is also compatible with broader visions of Cognitive Mesh Intelligence (CMI), in which multiple GRCLM nodes share domain knowledge in a distributed topology.
+
+\paragraph{Contributions.} This paper makes the following contributions:
+\begin{itemize}[noitemsep]
+    \item We introduce GRCLM, a new architecture for self-organizing domain specialization in LLMs, based on geometric routing and continual learning.
+    \item We derive a composite routing function that integrates similarity, Mahalanobis divergence, predictive entropy, and support ratios, and we analyze its properties.
+    \item We formalize emergent domain creation criteria using cluster density and variance constraints and relate them to OOD detection and clustering theory.
+    \item We define a shiftable transformer architecture with a shared trunk and specialist heads, and we describe a continual learning loop that allows the model to incorporate new experts over time.
+    \item We propose experimental designs and evaluation metrics for assessing GRCLM's routing accuracy, emergent domain quality, and stability under domain drift.
+\end{itemize}
+
+\section{Related Work}
+
+\subsection{Mixture-of-Experts and Sparse Models}
+
+Mixture-of-Experts (MoE) architectures introduce multiple expert subnetworks with a gating mechanism that selects a subset of experts per input \citep{jacobs1991adaptive}. In large-scale language modeling, \citet{lepikhin2020gshard} and \citet{fedus2022switch} demonstrated that MoE layers can significantly increase model capacity while maintaining computational efficiency. GLaM \citep{du2022glam} and BASE Layers \citep{lewis2021base} further refined sparse expert models for language tasks.
+
+These systems, however, share important limitations: the set of experts is typically fixed at training time, and the gating network is trained jointly with the experts. Adding new experts after deployment is non-trivial and generally requires retraining the gate on large volumes of data. GRCLM departs from this paradigm by using a \emph{geometric} router instead of a learned gate, enabling dynamic addition of new experts without retraining a gating network.
+
+\subsection{Continual Learning}
+
+Continual learning (or lifelong learning) studies how models can acquire new knowledge over time without catastrophic forgetting of previous tasks. Techniques include regularization-based approaches such as Elastic Weight Consolidation (EWC) \citep{kirkpatrick2017overcoming}, memory-based replay \citep{lopez2017gradient,rebuffi2017icarl}, and modular architectures with task-specific components \citep{rusu2016progressive}.
+
+In the context of LLMs, parameter-efficient fine-tuning methods such as adapters \citep{houlsby2019parameter} and LoRA \citep{hu2022lora} offer mechanisms for specialization with limited additional parameters. However, these methods generally assume predefined tasks or domains. GRCLM contributes a task-agnostic continual learning mechanism where ``tasks'' are \emph{emergent domains} discovered from the query stream itself.
+
+\subsection{Out-of-Distribution Detection}
+
+OOD detection aims to determine when an input does not belong to the training distribution. \citet{hendrycks2017baseline} studied OOD detection using softmax confidences, while \citet{lee2018simple} proposed a Mahalanobis distance-based method operating in feature space. Energy-based methods \citep{liu2020energy} and density-based approaches have also been explored.
+
+GRCLM uses Mahalanobis distance augmented with similarity, entropy, and empirical support to detect unknown domains. Unlike typical OOD methods that simply reject or flag outliers, GRCLM uses OOD signals as a driver for creating new experts.
+
+\subsection{Self-Improving and Adaptive Systems}
+
+Self-improving systems, such as AlphaGo-style self-play \citep{silver2017mastering} and self-training pipelines \citep{he2020revisiting}, allow models to generate or curate their own training data. More recently, LLM-based agents have been proposed that refine internal tools or policies over time \citep{schick2023toolformer,shinn2023reflexion}.
+
+GRCLM shares the spirit of self-improvement but is distinctive in that it \emph{modifies its own architecture} over time by spawning new domain experts and updating its domain topology based on geometric signals in embedding space.
+
+\subsection{Geometric Methods and Representation Topology}
+
+Centroid-based classifiers and nearest-class-mean methods are classical in pattern recognition \citep{hastie2009elements}. Subspace methods and principal angles are widely used to compare linear subspaces in signal processing and computer vision \citep{edelman1998geometry}. Representation space geometry has been used to interpret neural networks \citep{raghu2017svcca}.
+
+GRCLM incorporates these geometric ideas by assigning each domain a centroid and covariance structure and treating domains as manifolds in embedding space. The router uses both point-wise geometry (similarity and Mahalanobis distance) and subspace geometry (principal angles) to maintain a coherent domain topology.
+
+\section{Mathematical Foundations of GRCLM}
+
+\subsection{Embedding Space and Domain Distributions}
+
+Let $\mathcal{X}$ denote the space of text inputs, and let $E:\mathcal{X}\to\mathbb{R}^d$ be an embedding model that maps each input $x\in\mathcal{X}$ to a vector $q = E(x)\in\mathbb{R}^d$. We assume $E$ is fixed for routing purposes, although in practice it may share parameters with the transformer trunk.
+
+\begin{definition}[Domain]
+A \emph{domain} $k$ is characterized by a probability distribution $\mathcal{P}_k$ over $\mathbb{R}^d$ (the embedding space) together with estimated moments: a centroid $c_k\in\mathbb{R}^d$ and a covariance matrix $\Sigma_k\in\mathbb{R}^{d\times d}$.
+\end{definition}
+
+We interpret $c_k$ as the mean embedding of the domain and $\Sigma_k$ as capturing its local geometry. In practice, we maintain empirical estimates based on a corpus $\mathcal{C}_k$ of embeddings associated with domain $k$:
+\begin{align}
+c_k &= \frac{1}{|\mathcal{C}_k|}\sum_{q\in\mathcal{C}_k} q, \\
+\Sigma_k &= \frac{1}{|\mathcal{C}_k|-1}\sum_{q\in\mathcal{C}_k} (q - c_k)(q - c_k)^\top + \lambda I_d,
+\end{align}
+where $\lambda>0$ is a small regularization constant ensuring invertibility.
+
+\subsection{Routing Metrics}
+
+Given a query embedding $q\in\mathbb{R}^d$ and domain statistics $(c_k,\Sigma_k)$, GRCLM computes several metrics.
+
+\paragraph{Cosine similarity.}
+\begin{equation}
+s_k(q) = \frac{q^\top c_k}{\|q\|\|c_k\|}.
+\end{equation}
+This measures directional alignment between $q$ and the domain centroid.
+
+\paragraph{Mahalanobis distance.}
+\begin{equation}
+m_k(q) = \sqrt{(q - c_k)^\top \Sigma_k^{-1}(q - c_k)}.
+\end{equation}
+Assuming $\mathcal{P}_k$ is approximately Gaussian, $m_k(q)^2$ is proportional to the squared number of standard deviations from the mean in the domain's metric.
+
+\paragraph{Predictive entropy.}
+Let $p_{k,i}(q)$ denote the predictive probability for token $i$ from specialist head $k$ given context corresponding to $q$. We define:
+\begin{equation}
+H_k(q) = - \sum_i p_{k,i}(q)\log p_{k,i}(q),
+\end{equation}
+which serves as a proxy for epistemic uncertainty: high entropy suggests the specialist is unsure about its prediction.
+
+\paragraph{Support ratio.}
+We also maintain an empirical support score $r_k\in[0,1]$ for each domain, reflecting how often the router has successfully assigned queries to domain $k$ in the recent past. One simple formulation is:
+\begin{equation}
+r_k = \frac{N_k}{\sum_j N_j},
+\end{equation}
+where $N_k$ is the number of queries routed to domain $k$ over a sliding window.
+
+\subsection{Composite Routing Score}
+
+GRCLM combines these metrics into a composite routing score.
+
+\begin{definition}[Composite routing score]
+Given weights $\alpha,\beta,\gamma,\delta\ge 0$, the composite routing score for domain $k$ and query embedding $q$ is
+\begin{equation}
+R_k(q) = \alpha s_k(q) - \beta m_k(q) - \gamma H_k(q) + \delta r_k.
+\end{equation}
+The chosen domain is
+\begin{equation}
+\hat{k}(q) = \arg\max_k R_k(q).
+\end{equation}
+\end{definition}
+
+Intuitively, $R_k$ increases with similarity and support, and decreases with distance and uncertainty. The following result formalizes monotonicity.
+
+\begin{proposition}[Monotonicity properties]
+Fix all quantities except one metric. Then for any domain $k$ and query $q$:
+\begin{enumerate}[noitemsep]
+    \item $\frac{\partial R_k(q)}{\partial s_k} = \alpha \ge 0$, so $R_k$ is non-decreasing in similarity.
+    \item $\frac{\partial R_k(q)}{\partial m_k} = -\beta \le 0$, so $R_k$ is non-increasing in Mahalanobis distance.
+    \item $\frac{\partial R_k(q)}{\partial H_k} = -\gamma \le 0$, so $R_k$ is non-increasing in entropy.
+    \item $\frac{\partial R_k(q)}{\partial r_k} = \delta \ge 0$, so $R_k$ is non-decreasing in support.
+\end{enumerate}
+\end{proposition}
+
+\begin{proof}
+Immediate from the linear form of $R_k$.
+\end{proof}
+
+\subsection{Unknown Domain Criteria}
+
+GRCLM must determine when a query does not belong to any known domain. We formalize this as follows.
+
+\begin{definition}[Unknown-domain condition]
+Given thresholds $\tau_s,\tau_m,\tau_h,\tau_r$, a query embedding $q$ is classified as \emph{unknown-domain} if
+\begin{equation}
+\label{eq:unknown}
+\max_k s_k(q) < \tau_s \;\;\lor\;\;
+\min_k m_k(q) > \tau_m \;\;\lor\;\;
+\min_k H_k(q) > \tau_h \;\;\lor\;\;
+\max_k r_k < \tau_r.
+\end{equation}
+\end{definition}
+
+Thus, a query is considered unknown if it is not sufficiently similar to any centroid, is too distant in Mahalanobis space, induces high uncertainty in all specialists, or no domain has adequate empirical support.
+
+\begin{remark}
+In practice, GRCLM may use a subset of these criteria or combine them into a scalar OOD score. The disjunctive form in (\ref{eq:unknown}) is conservative: it favors declaring a query unknown when any metric strongly suggests novelty.
+\end{remark}
+
+\subsection{Emergent Domain Clusters}
+
+Unknown-domain queries are not discarded; instead, GRCLM accumulates them into a buffer that may form the seed of a new domain.
+
+Let $\mathcal{B}$ be the emergent buffer, storing embeddings $q_1,\dots,q_n$. Define the empirical mean and variance:
+\begin{align}
+\bar{q} &= \frac{1}{n}\sum_{i=1}^n q_i,\\
+\sigma^2 &= \frac{1}{n}\sum_{i=1}^n \|q_i - \bar{q}\|^2.
+\end{align}
+
+\begin{definition}[Emergent domain condition]
+Given a minimum cluster size $N_{\min}$ and maximum variance $\sigma^2_{\max}$, GRCLM spawns a new domain when
+\begin{equation}
+n = |\mathcal{B}| \ge N_{\min} \quad \text{and}\quad \sigma^2 \le \sigma^2_{\max}.
+\end{equation}
+\end{definition}
+
+This encodes the intuition that a new domain should be supported by enough examples and that these examples should be coherent in embedding space.
+
+\begin{proposition}[Concentration under isotropic assumptions]
+Suppose unknown-domain embeddings are sampled i.i.d.\ from an isotropic Gaussian distribution $\mathcal{N}(\mu^\star,\sigma_\star^2 I_d)$. Then for any $\epsilon>0$, there exists $N_{\min}$ such that with probability at least $1-\epsilon$, the empirical variance $\sigma^2$ satisfies $|\sigma^2 - d\sigma_\star^2| \le \epsilon$ for all $n\ge N_{\min}$.
+\end{proposition}
+
+\begin{proof}
+This follows from standard concentration bounds for sample covariance of Gaussian distributions; see, e.g., \citet{vershynin2018high}.
+\end{proof}
+
+While real embeddings are not Gaussian, this heuristic underlies the use of variance as a coherence measure for emergent domains.
+
+\section{Geometric Topology of Domains}
+
+So far, we have treated domains as point clusters with centroids and covariance matrices. We now describe the geometric relationships between domains.
+
+\subsection{Centroid Angles}
+
+For domains $j$ and $k$, the angle between centroids is
+\begin{equation}
+\theta_{jk} = \arccos\left(\frac{c_j^\top c_k}{\|c_j\|\|c_k\|}\right).
+\end{equation}
+Small angles indicate similar central directions in embedding space, suggesting higher overlap in semantic content.
+
+\subsection{Domain Subspaces and Principal Angles}
+
+Consider the eigendecomposition of each covariance matrix:
+\begin{equation}
+\Sigma_k = U_k \Lambda_k U_k^\top,
+\end{equation}
+where $U_k$ contains eigenvectors and $\Lambda_k$ eigenvalues. The leading eigenvectors span a subspace capturing principal directions of variation.
+
+\begin{definition}[Domain subspace]
+Let $U_k^{(r)}$ denote the matrix of the top $r$ eigenvectors of $\Sigma_k$. The column space $\mathcal{S}_k = \text{span}(U_k^{(r)})$ is the $r$-dimensional \emph{domain subspace} of domain $k$.
+\end{definition}
+
+To compare two subspaces $\mathcal{S}_j$ and $\mathcal{S}_k$, we compute their principal angles \citep{edelman1998geometry}. Let $U_j^{(r)}$ and $U_k^{(r)}$ be orthonormal bases; compute the singular value decomposition
+\begin{equation}
+(U_j^{(r)})^\top U_k^{(r)} = P \Sigma Q^\top,
+\end{equation}
+where $\Sigma = \text{diag}(\sigma_1,\dots,\sigma_r)$ with $\sigma_\ell\in[0,1]$. Then the principal angles $\phi_1,\dots,\phi_r$ are defined by
+\begin{equation}
+\phi_\ell = \arccos(\sigma_\ell).
+\end{equation}
+
+\begin{remark}
+Principal angles near zero indicate strong alignment between domains' principal directions, while angles near $\pi/2$ indicate near-orthogonality. GRCLM can use these angles to enforce topological coherence, e.g., by discouraging the creation of new domains too close to existing ones.
+\end{remark}
+
+\section{Shiftable Transformer Architecture}
+
+GRCLM employs a \emph{shiftable transformer language model} (STLM) with a shared trunk and specialist heads.
+
+Let $T_\theta$ denote the shared transformer trunk with parameters $\theta$, and let $H_{\phi_k}$ denote the specialist head for domain $k$ with parameters $\phi_k$. Given an input sequence $x$ mapped to token embeddings, we compute:
+\begin{align}
+h &= T_\theta(x),\\
+y &= H_{\phi_k}(h),
+\end{align}
+where $y$ represents the logits or probabilities over the vocabulary.
+
+\subsection{Parameter Sharing and Specialization}
+
+The trunk $T_\theta$ captures general linguistic and reasoning capabilities and is shared across all domains. Each specialist $H_{\phi_k}$ focuses on fine-grained adjustments that capture domain-specific lexical or structural patterns.
+
+\begin{definition}[Shiftable model]
+A model is \emph{shiftable} if it can switch the active specialist head $H_{\phi_k}$ at inference time based on a routing decision, without modifying the underlying trunk $T_\theta$.
+\end{definition}
+
+GRCLM is shiftable by design: the geometric router selects domain $\hat{k}$ and activates $H_{\phi_{\hat{k}}}$ for generation.
+
+\section{Continual Learning in GRCLM}
+
+\subsection{Training Objective}
+
+Let $\mathcal{D}$ denote the union of all domain corpora and the general corpus. Each training example is a triple $(x,y,d)$, where $x$ is input, $y$ is target output, and $d$ is the domain label (possibly ``general'').
+
+The primary loss is next-token prediction loss:
+\begin{equation}
+\mathcal{L}_{\text{base}}(\theta,\{\phi_k\}) = \mathbb{E}_{(x,y,d)\sim\mathcal{D}}[\ell(H_{\phi_d}(T_\theta(x)), y)].
+\end{equation}
+
+To mitigate catastrophic forgetting, we may add regularization terms. For example, an EWC-style penalty \citep{kirkpatrick2017overcoming}:
+\begin{equation}
+\mathcal{L}_{\text{reg}}(\theta) = \sum_i \frac{\lambda_{\text{ewc}}}{2} F_i (\theta_i - \theta_i^{\text{old}})^2,
+\end{equation}
+where $F_i$ are Fisher information coefficients and $\theta^{\text{old}}$ are previous trunk parameters.
+
+The total objective becomes
+\begin{equation}
+\mathcal{L} = \mathcal{L}_{\text{base}} + \mathcal{L}_{\text{reg}}.
+\end{equation}
+
+\subsection{Update Schedule}
+
+When a new domain $k^\star$ emerges, GRCLM triggers a continual learning cycle:
+\begin{enumerate}[noitemsep]
+    \item Initialize a new specialist head $H_{\phi_{k^\star}}$ (randomly or from a template).
+    \item Construct a training set including:
+    \begin{itemize}[noitemsep]
+        \item Emergent corpus for $k^\star$.
+        \item Subsampled data from existing domains.
+        \item General corpus (optional).
+    \end{itemize}
+    \item Optimize $\mathcal{L}$ with respect to $\theta$ and $\phi_{k^\star}$ (and optionally refine $\phi_k$ for existing domains).
+    \item Recompute centroids and covariances for all domains.
+    \item Update router thresholds and support ratios.
+\end{enumerate}
+
+\subsection{Stability Considerations}
+
+Updating the shared trunk risks degrading performance on previously learned domains. GRCLM can modulate this trade-off via:
+\begin{itemize}[noitemsep]
+    \item Lower learning rates for $\theta$ than for $\phi_{k^\star}$.
+    \item Partial freezing of trunk layers.
+    \item Stronger regularization penalties for deviations from $\theta^{\text{old}}$.
+\end{itemize}
+
+\section{Algorithmic Workflow}
+
+Algorithm~\ref{alg:grclm} summarizes the GRCLM routing and emergence loop.
+
+\begin{algorithm}[t]
+\caption{GRCLM Routing and Emergence}
+\label{alg:grclm}
+\begin{algorithmic}[1]
+\STATE Initialize domains, router statistics, trunk $T_\theta$, and heads $H_{\phi_k}$.
+\STATE Initialize emergence buffer $\mathcal{B} \gets \emptyset$.
+\WHILE{system is running}
+    \STATE Receive query $x$ and compute embedding $q \gets E(x)$.
+    \STATE Compute routing metrics $s_k(q)$, $m_k(q)$, $H_k(q)$, $r_k$ for all domains $k$.
+    \IF{unknown-domain condition (\ref{eq:unknown}) holds}
+        \STATE Append $(x,q)$ to buffer $\mathcal{B}$.
+        \IF{$|\mathcal{B}| \ge N_{\min}$ and variance $\sigma^2 \le \sigma^2_{\max}$}
+            \STATE Spawn new domain $k^\star$ with corpus from $\mathcal{B}$.
+            \STATE Initialize specialist head $H_{\phi_{k^\star}}$.
+            \STATE Run continual learning update on $T_\theta$ and $\phi_{k^\star}$.
+            \STATE Recompute centroids and covariances for all domains.
+            \STATE Reset $\mathcal{B} \gets \emptyset$.
+        \ENDIF
+    \ELSE
+        \STATE Route to $\hat{k} = \arg\max_k R_k(q)$ and generate response using $H_{\phi_{\hat{k}}}$.
+        \STATE Update support ratio $r_{\hat{k}}$.
+    \ENDIF
+\ENDWHILE
+\end{algorithmic}
+\end{algorithm}
+
+\section{Experimental Design}
+
+We briefly outline experiments suitable for evaluating GRCLM.
+
+\subsection{Synthetic Multi-Domain Benchmark}
+
+Construct a synthetic benchmark with several distinct domains (e.g., programming, medical, legal, fiction), each with its own training corpus. Train GRCLM on a subset of domains, then introduce queries from a novel domain and allow the system to create a new specialist.
+
+Metrics:
+\begin{itemize}[noitemsep]
+    \item Routing accuracy before and after emergence.
+    \item Specialist perplexity on its domain.
+    \item Impact on existing domains' performance.
+\end{itemize}
+
+\subsection{Domain Drift}
+
+Simulate domain drift by gradually changing the distribution of queries within a domain. Measure:
+\begin{itemize}[noitemsep]
+    \item Centroid motion and covariance change over time.
+    \item Router's ability to maintain correct routing.
+    \item Whether GRCLM decides to split or merge domains.
+\end{itemize}
+
+\subsection{Ablation Studies}
+
+Evaluate GRCLM variants:
+\begin{itemize}[noitemsep]
+    \item Without entropy term ($\gamma=0$).
+    \item Without support ratio term ($\delta=0$).
+    \item With frozen trunk versus adaptive trunk.
+\end{itemize}
+
+\section{Discussion}
+
+GRCLM proposes a shift from static LLM deployment to self-organizing expert architectures. By rooting domain routing and emergence in explicit geometric quantities, GRCLM offers transparency and controllability that are difficult to obtain with purely learned gates. At the same time, the architecture inherits challenges from both continual learning and sparse expert systems, including complexity of orchestration, sensitivity to hyperparameters, and the need for robust monitoring in deployment.
+
+\section{Future Work}
+
+Future directions include:
+\begin{itemize}[noitemsep]
+    \item Hierarchical geometric routing with multi-level domain trees.
+    \item Distributed GRCLM nodes exchanging domain summaries in a cognitive mesh.
+    \item Parameter-efficient specialists using LoRA or adapters to scale to hundreds or thousands of domains.
+    \item Incorporating human feedback for domain naming, merging, or pruning.
+\end{itemize}
+
+\section{Conclusion}
+
+We have presented GRCLM, a Geometric Routing \& Continual Learning Model for self-organizing language model specialization. GRCLM unifies geometric domain routing, emergent domain creation, and continual learning in a shiftable transformer architecture. This work lays the mathematical and architectural foundation for LLMs that can grow, adapt, and restructure themselves in response to open-world demands.
+
+\bibliographystyle{plainnat}
+\bibliography{references}
+
+\end{document}
