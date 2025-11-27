@@ -1,6 +1,7 @@
 # SMA PoC – Shiftable Multi-Agent Language Model API
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.17728861.svg)](https://doi.org/10.5281/zenodo.17728861)
 
-This project (`sma_poc`) wraps your **shiftable_project** and **shiftable_attention** package
+This project (`sma_poc`) wraps **shiftable_project** and **shiftable_attention** package
 in a FastAPI service that:
 
 - Trains a **generalist** Transformer language model on first startup.
