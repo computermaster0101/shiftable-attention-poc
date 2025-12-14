@@ -99,7 +99,7 @@ def main() -> None:
     if not file_paths:
         raise RuntimeError(f"No .txt files found in {args.data_dir}")
 
-    tokenizer = SimpleTokenizer.build_from_files(file_paths, min_freq=args.min_freq)
+    tokenizer = SimpleTokenizer.build_from_files(file_paths, min_freq=args.min_freq, max_vocab_size=args.max_vocab_size)
     tokenizer_path = os.path.join(args.output_dir, "tokenizer.json")
     tokenizer.save(tokenizer_path)
 

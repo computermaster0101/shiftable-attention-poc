@@ -145,12 +145,15 @@ class ShiftableMultiheadAttention(nn.Module):
         return outs
 
     def forward(
-        self,
-        x: torch.Tensor,
-        attn_mask: Optional[torch.Tensor] = None,
-        key_padding_mask: Optional[torch.Tensor] = None,
-        return_gate: bool = False,
-    ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+            self,
+            x: torch.Tensor,
+            attn_mask: Optional[torch.Tensor] = None,
+            key_padding_mask: Optional[torch.Tensor] = None,
+            return_gate: bool = False,
+            domain_prior: Optional[torch.Tensor] = None,
+            domain_mask: Optional[torch.Tensor] = None,
+        ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
+
         """
         Args:
             x: [batch, seq_len, d_model]
@@ -173,6 +176,27 @@ class ShiftableMultiheadAttention(nn.Module):
         # 3) Compute gate weights over domains
         pooled = self.pool_hidden(x)               # [b, d]
         logits = self.gate(pooled)                 # [b, 1 + num_specialists]
+
+        # Optional: inject geometric prior / mask from DomainRouter.
+        if domain_prior is not None:
+            # domain_prior: [num_domains] or [1, num_domains]
+            prior = domain_prior.to(logits.device)
+            if prior.dim() == 1:
+                prior = prior.unsqueeze(0)  # [1, num_domains]
+            prior = prior.expand_as(logits)  # [b, num_domains]
+            eps = 1e-8
+            prior = torch.clamp(prior, min=eps)
+            logits = logits + torch.log(prior)
+
+        if domain_mask is not None:
+            # domain_mask: 0/1 or bool, shape [num_domains] or [1, num_domains]
+            mask = domain_mask.to(logits.device)
+            if mask.dim() == 1:
+                mask = mask.unsqueeze(0)
+            mask = mask.expand_as(logits)
+            # Block masked domains by sending their logits to -inf
+            logits = logits.masked_fill(mask == 0, float("-inf"))
+
         gate = F.softmax(logits, dim=-1)           # [b, 1 + num_specialists]
 
         # Split gate weights

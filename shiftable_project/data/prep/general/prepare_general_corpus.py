@@ -36,8 +36,8 @@ from typing import Optional
 
 # Approximate limits to avoid exploding disk/memory use.
 # Set to None to process entire datasets.
-MAX_WIKTIONARY_LINES: Optional[int] = 1_000_000    # lines from Kaikki JSONL
-MAX_WIKIPEDIA_PAGES: Optional[int] = 50_000        # pages from Simple English Wikipedia
+MAX_WIKTIONARY_LINES: Optional[int] = None    # lines from Kaikki JSONL
+MAX_WIKIPEDIA_PAGES: Optional[int] = 1_000_000        # pages from Simple English Wikipedia
 
 # Source URLs
 GUTENBERG_FERNALD_URL = "https://www.gutenberg.org/ebooks/28900.txt.utf-8"
@@ -242,12 +242,19 @@ def build_wiktionary_source(paths: dict) -> None:
             if not word or not senses:
                 continue
 
-            # Build a compact textual representation combining glosses and examples
+                        # Build a compact textual representation combining glosses and examples
             gloss_texts = []
             for sense in senses:
+                # Kaikki/Wiktextract usually uses "glosses": [ ... ]
                 gloss = sense.get("gloss")
                 if not gloss:
+                    glosses = sense.get("glosses") or []
+                    if glosses:
+                        gloss = glosses[0]  # take first gloss
+
+                if not gloss:
                     continue
+
                 examples = sense.get("examples") or []
                 example_texts = []
                 for ex in examples:
@@ -258,10 +265,12 @@ def build_wiktionary_source(paths: dict) -> None:
                         ex_t = ex.get("text")
                         if ex_t:
                             example_texts.append(ex_t)
+
                 if example_texts:
                     gloss_texts.append(gloss + " Examples: " + " | ".join(example_texts))
                 else:
                     gloss_texts.append(gloss)
+
 
             if not gloss_texts:
                 continue

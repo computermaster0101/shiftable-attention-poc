@@ -43,6 +43,7 @@ class SimpleTokenizer:
         cls,
         paths: List[str],
         min_freq: int = 1,
+        max_vocab_size: int | None = None,
     ) -> "SimpleTokenizer":
         counter: Counter[str] = Counter()
         for path in paths:
@@ -60,11 +61,29 @@ class SimpleTokenizer:
             stoi[sp] = len(itos)
             itos.append(sp)
 
-        # Add remaining tokens by frequency
-        for token, freq in counter.items():
-            if freq >= min_freq and token not in stoi:
-                stoi[token] = len(itos)
-                itos.append(token)
+        # Filter by min_freq and sort by frequency (desc)
+        items = [
+            (token, freq)
+            for token, freq in counter.items()
+            if freq >= min_freq and token not in stoi
+        ]
+        items.sort(key=lambda x: x[1], reverse=True)
+
+        # If we have a max vocab size, truncate
+        if max_vocab_size is not None:
+            # max number of non-special tokens we can add
+            remaining = max_vocab_size - len(itos)
+            if remaining < 0:
+                remaining = 0
+            items = items[:remaining]
+
+        # Add remaining tokens
+        for token, freq in items:
+            stoi[token] = len(itos)
+            itos.append(token)
+
+        print(f"[tokenizer] Built vocab of size {len(itos)} "
+              f"(min_freq={min_freq}, max_vocab_size={max_vocab_size})")
 
         return cls(stoi=stoi, itos=itos)
 

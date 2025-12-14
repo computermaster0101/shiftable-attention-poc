@@ -84,15 +84,22 @@ DROPOUT = 0.1
 # Maximum sequence length (tokens)
 MAX_SEQ_LEN = 256
 
+# Whether specialists pool from CLS token or mean of sequence
+USE_CLS_TOKEN_POOL = False
+
 # --------------------------------------------------------------------- #
 # Generalist training hyperparameters
 # --------------------------------------------------------------------- #
 
 # Minimum token frequency when building tokenizer vocab
-GENERAL_MIN_FREQ = 2
+GENERAL_MIN_FREQ = 5
+
+# Maximum vocabulary size (including specials)
+# Adjust to 20k–50k depending on corpus size and hardware limits
+GENERAL_MAX_VOCAB_SIZE = 25000
 
 # Batch size for generalist pretraining
-GENERAL_BATCH_SIZE = 32
+GENERAL_BATCH_SIZE = 8
 
 # Number of epochs for generalist training
 GENERAL_EPOCHS = 3
@@ -105,7 +112,7 @@ GENERAL_LR = 3e-4
 # --------------------------------------------------------------------- #
 
 # Batch size for training the shiftable model (generalist + specialists)
-SHIFTABLE_BATCH_SIZE = 32
+SHIFTABLE_BATCH_SIZE = 8
 
 # Number of epochs for shiftable training
 SHIFTABLE_EPOCHS = 3
@@ -140,8 +147,8 @@ ROUTER_DELTA = 0.0
 # If the best similarity is below ROUTER_UNKNOWN_MAX_SIM and the best
 # Mahalanobis distance is above ROUTER_UNKNOWN_MIN_DIST, the router will
 # mark the query as is_unknown=True and send it to emergence.
-ROUTER_UNKNOWN_MAX_SIM = 0.15
-ROUTER_UNKNOWN_MIN_DIST = 5.0
+ROUTER_UNKNOWN_MAX_SIM = -1.0
+ROUTER_UNKNOWN_MIN_DIST = 1e9
 
 # --------------------------------------------------------------------- #
 # Emergent expert configuration
@@ -266,12 +273,12 @@ ROUTER_UNKNOWN_MIN_DIST = 5.0        # distance threshold
 # Optional entropy-based unknown threshold. If set to None, entropy is
 # NOT used for unknown detection. A reasonable starting value is around
 # the entropy of p=0.75 in bits (~0.81), but we work in nats here.
-ROUTER_UNKNOWN_MAX_ENTROPY = 1.0     # in nats; set to None to disable
+ROUTER_UNKNOWN_MAX_ENTROPY = None     # in nats; set to None to disable
 
 # Support-based unknown detection:
 # If even the most supported domain has r_k < ROUTER_UNKNOWN_MIN_SUPPORT,
 # the query is treated as unknown. Set to 0.0 to disable.
-ROUTER_UNKNOWN_MIN_SUPPORT = 0.02    # e.g. 2% of recent routed queries
+ROUTER_UNKNOWN_MIN_SUPPORT = 0.00    # e.g. 2% of recent routed queries
 
 # r_k = N_k / sum_j N_j  over the most recent ROUTER_SUPPORT_WINDOW queries.
 ROUTER_SUPPORT_WINDOW = 1024
@@ -280,3 +287,6 @@ ROUTER_SUPPORT_WINDOW = 1024
 # unknown detection. This prevents a cold-start catch-22 where support is 0 for
 # all domains and everything is permanently marked unknown.
 ROUTER_SUPPORT_WARMUP_MIN_EVENTS = 128
+
+# How many specialist advisors (besides base) to invite per query
+ROUTER_TOP_K_ADVISORS = 3

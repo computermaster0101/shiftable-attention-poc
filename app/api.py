@@ -39,10 +39,15 @@ class GenerateResponse(BaseModel):
     completion: str
     full_text: str
     specialists: List[str]
+    active_specialists: List[str]
+    active_weights: List[float]
 
 
 class AddSpecialistRequest(BaseModel):
-    name: str = Field(..., description="Name of the new specialist. Must match data/<name> directory.")
+    name: str = Field(
+        ...,
+        description="Name of the new specialist. Must match data/<name> directory.",
+    )
 
 
 class AddSpecialistResponse(BaseModel):
@@ -79,7 +84,9 @@ def on_startup() -> None:
         # We don't crash the app on startup, but health endpoint will show the failure
         import logging
 
-        logging.getLogger(__name__).exception("Error during startup initialization: %s", e)
+        logging.getLogger(__name__).exception(
+            "Error during startup initialization: %s", e
+        )
 
 
 @app.get("/", response_class=HTMLResponse)
@@ -89,7 +96,9 @@ def root() -> HTMLResponse:
     """
     index_path = FRONTEND_DIR / "index.html"
     if not index_path.exists():
-        raise HTTPException(status_code=500, detail="Frontend index.html not found.")
+        raise HTTPException(
+            status_code=500, detail="Frontend index.html not found."
+        )
     return HTMLResponse(index_path.read_text(encoding="utf-8"))
 
 
@@ -142,6 +151,8 @@ def generate(req: GenerateRequest) -> GenerateResponse:
             completion=result["completion"],
             full_text=result["full_text"],
             specialists=specialists,
+            active_specialists=result.get("active_specialists", []),
+            active_weights=result.get("active_weights", []),
         )
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))

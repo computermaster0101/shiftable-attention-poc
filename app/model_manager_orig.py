@@ -1,8 +1,6 @@
 from __future__ import annotations
 
 import json
-import time
-import os
 import logging
 import math
 import shutil
@@ -139,11 +137,9 @@ class ModelManager:
 
     Also integrates:
       - DomainRouter for geometric routing over domains.
-        [primary testing for this phase of the prototype]
       - Automatic emergent expert creation: unknown-domain queries are collected
         into emergent corpora, and once enough samples are gathered, a new
-        specialist is registered and the shiftable model is retrained. 
-        [this is placeholder logic and not correct. Agentic or Human-in-the-loop specialist creation required]
+        specialist is registered and the shiftable model is retrained.
     """
 
     def __init__(self) -> None:
@@ -161,7 +157,6 @@ class ModelManager:
         # In-memory buffer of unknown-domain embeddings used to decide when
         # to spawn new emergent specialists based on the geometric clustering
         # condition (Definition 4 in the GRCLM paper).
-        # [this is placeholder logic and not correct. Agentic or Human-in-the-loop specialist creation required]
         self._emergent_buffer: List[torch.Tensor] = []
 
     # ------------------------------------------------------------------ #
@@ -216,15 +211,7 @@ class ModelManager:
         tokenizer = SimpleTokenizer.build_from_files(
             file_paths,
             min_freq=config.GENERAL_MIN_FREQ,
-            max_vocab_size=config.GENERAL_MAX_VOCAB_SIZE,
-            )
-        logger.info(
-            "Tokenizer built. vocab_size=%d (min_freq=%d, max_vocab_size=%d)",
-            tokenizer.vocab_size,
-            config.GENERAL_MIN_FREQ,
-            getattr(config, "GENERAL_MAX_VOCAB_SIZE", 50_000),
         )
-
         config.TOKENIZER_PATH.parent.mkdir(parents=True, exist_ok=True)
         tokenizer.save(str(config.TOKENIZER_PATH))
         logger.info("Saved tokenizer to %s", config.TOKENIZER_PATH)
@@ -232,11 +219,7 @@ class ModelManager:
         # Build dataset/dataloader
         texts = load_texts_from_files(file_paths)
         dataset = LMDataset(texts, tokenizer, seq_len=config.MAX_SEQ_LEN)
-        dataloader = DataLoader(
-            dataset, 
-            batch_size=config.GENERAL_BATCH_SIZE, 
-            shuffle=True,
-            )
+        dataloader = DataLoader(dataset, batch_size=config.GENERAL_BATCH_SIZE, shuffle=True)
 
         # Initialize model
         model = BaseTransformerLM(
@@ -253,19 +236,15 @@ class ModelManager:
         optimizer = torch.optim.Adam(model.parameters(), lr=config.GENERAL_LR)
 
         # Training loop
-        logger.info("Beginning training loop")
         for epoch in range(1, config.GENERAL_EPOCHS + 1):
-            start = time.time()
             train_loss = _train_one_epoch(model, dataloader, optimizer, self.device, pad_id=tokenizer.pad_id)
             val_loss = _evaluate(model, dataloader, self.device, pad_id=tokenizer.pad_id)
-            epoch_time = time.time() - start
             logger.info(
-                "[Generalist] Epoch %d/%d - train loss: %.4f, val loss: %.4f, Duration: %d seconds",
+                "[Generalist] Epoch %d/%d - train loss: %.4f, val loss: %.4f",
                 epoch,
                 config.GENERAL_EPOCHS,
                 train_loss,
                 val_loss,
-                epoch_time
             )
 
         ckpt = {
@@ -359,11 +338,7 @@ class ModelManager:
             datasets.append(spec_ds)
 
         train_dataset = ConcatDataset(datasets)
-        dataloader = DataLoader(
-            train_dataset, 
-            batch_size=config.SHIFTABLE_BATCH_SIZE, 
-            shuffle=True,
-            )
+        dataloader = DataLoader(train_dataset, batch_size=config.SHIFTABLE_BATCH_SIZE, shuffle=True)
 
         optimizer = torch.optim.Adam(
             filter(lambda p: p.requires_grad, shift_model.parameters()),
@@ -572,48 +547,6 @@ class ModelManager:
         with open(config.EMERGENT_STATE_PATH, "w", encoding="utf-8") as f:
             json.dump(data, f)
 
-    def _log_input_output(
-        self,
-        prompt: str,
-        completion: str,
-        query_embedding,
-        routing_result,
-        domain_prior,
-        domain_mask,
-    ):
-        os.makedirs("logs", exist_ok=True)
-        path = os.path.join("logs", "input_output_log.jsonl")
-
-        record = {
-            "timestamp": time.time(),
-            "prompt": prompt,
-            "completion": completion,
-            "embedding": query_embedding.tolist() if hasattr(query_embedding, "tolist") else None,
-            "routing": None,
-            "domain_prior": domain_prior.tolist() if domain_prior is not None else None,
-            "domain_mask": domain_mask.tolist() if domain_mask is not None else None,
-            "is_unknown_domain": routing_result.is_unknown if routing_result else None,
-        }
-
-        if routing_result:
-            record["routing"] = {
-                "is_unknown": routing_result.is_unknown,
-                "metrics": [
-                    {
-                        "name": m.name,
-                        "similarity": m.similarity,
-                        "mahalanobis": m.mahalanobis,
-                        "entropy": m.entropy,
-                        "support": m.support,
-                        "score": m.score,
-                    }
-                    for m in routing_result.metrics
-                ],
-            }
-
-        with open(path, "a") as f:
-            f.write(json.dumps(record) + "\n")
-
     def _handle_emergent_query(
         self,
         prompt: str,
@@ -622,7 +555,6 @@ class ModelManager:
         routing_result: Optional[RoutingResult],
     ) -> None:
         """
-        [This is placeholder logic and not correct. Agentic or Human-in-the-loop specialist creation required]
         Handle a query that appears to be outside existing domain coverage.
 
         Behavior:
@@ -877,64 +809,6 @@ class ModelManager:
 
             logger.info("Successfully deleted specialist '%s'. Remaining: %s", name, ", ".join(self.specialist_names))
             return list(self.specialist_names)
-        
-    def _build_domain_prior_from_routing(
-        self,
-        routing_result: RoutingResult,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        Turn DomainRouter metrics into:
-          - domain_prior: soft prior over domains (base + specialists)
-          - domain_mask: which domains are allowed (1) vs blocked (0)
-
-        Domain index convention:
-          idx 0: "general" (base)
-          idx i>0: self.specialist_names[i-1]
-        """
-        assert self.specialist_names is not None
-
-        num_specialists = len(self.specialist_names)
-        num_domains = 1 + num_specialists  # general + specialists
-
-        # Map names -> indices
-        name_to_idx: Dict[str, int] = {"general": 0}
-        for i, name in enumerate(self.specialist_names, start=1):
-            name_to_idx[name] = i
-
-        scores = torch.full((num_domains,), float("-inf"))
-        # Fill with composite scores from router
-        for m in routing_result.metrics:
-            idx = name_to_idx.get(m.name)
-            if idx is not None:
-                scores[idx] = float(m.score)
-
-        # Always keep base in the game; if it was -inf, give it a neutral score
-        if not torch.isfinite(scores[0]):
-            scores[0] = 0.0
-
-        # Top-K over specialists only (1..num_domains-1)
-        k = getattr(config, "ROUTER_TOP_K_ADVISORS", 3)
-        k = max(0, min(k, num_specialists))
-
-        domain_mask = torch.zeros(num_domains, dtype=torch.float32)
-        domain_mask[0] = 1.0  # always include base
-
-        if k > 0 and num_specialists > 0:
-            spec_scores = scores[1:]
-            # Some specialists might still be -inf if router had no stats for them.
-            # torch.topk will still give indices; we'll filter invalid ones.
-            top_vals, top_idx = torch.topk(spec_scores, k=min(k, num_specialists))
-            for v, idx_rel in zip(top_vals, top_idx):
-                if torch.isfinite(v):
-                    domain_mask[1 + int(idx_rel)] = 1.0
-
-        # Prior only over allowed domains: softmax on masked scores
-        masked_scores = scores.clone()
-        masked_scores[domain_mask == 0] = float("-inf")
-        domain_prior = torch.softmax(masked_scores, dim=0)
-
-        return domain_prior, domain_mask
-
 
     def _compute_query_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
@@ -975,8 +849,8 @@ class ModelManager:
         Autoregressive generation using the current shiftable model, plus
         geometric routing and automatic emergent expert creation.
 
-        Now the geometric router is also used to steer which specialist heads
-        participate in answering the query.
+        Even if there are no specialists, the generalist will still answer,
+        and queries will be collected into emergent corpora.
         """
         self.ensure_initialized()
         assert self.shift_model is not None
@@ -984,99 +858,10 @@ class ModelManager:
 
         self.shift_model.eval()
 
-        # ---------------------------------------------------------------------
-        # 1) Encode prompt
-        # ---------------------------------------------------------------------
+        # Encode prompt
         input_ids = self.tokenizer.encode(prompt, add_specials=True)
-        input_ids_tensor = torch.tensor(
-            input_ids,
-            dtype=torch.long,
-            device=self.device,
-        ).unsqueeze(0)
+        input_ids_tensor = torch.tensor(input_ids, dtype=torch.long, device=self.device).unsqueeze(0)
 
-        # ---------------------------------------------------------------------
-        # 2) Compute query embedding and run geometric routing over domains
-        # ---------------------------------------------------------------------
-        base_input_ids_tensor = torch.tensor(
-            input_ids,
-            dtype=torch.long,
-            device=self.device,
-        )
-        query_embedding = self._compute_query_embedding(base_input_ids_tensor)
-
-        routing_result: Optional[RoutingResult] = None
-        if self.specialist_names:
-            routing_result = self.router.route(query_embedding)
-
-        domain_prior: Optional[torch.Tensor] = None  # shape [1, 1 + num_specialists]
-        domain_mask: Optional[torch.Tensor] = None   # shape [1, 1 + num_specialists]
-
-        # Only build a prior/mask if we have specialists AND the router thinks
-        # this query belongs to a known domain.
-        if (
-            self.specialist_names
-            and routing_result is not None
-            and not routing_result.is_unknown
-        ):
-            num_specialists = len(self.specialist_names)
-            num_domains = 1 + num_specialists  # general/base + specialists
-
-            # Map domain names to indices:
-            #   0          -> "general" (base)
-            #   i (>= 1)   -> self.specialist_names[i-1]
-            name_to_idx: Dict[str, int] = {"general": 0}
-            for i, name in enumerate(self.specialist_names, start=1):
-                name_to_idx[name] = i
-
-            # Start with -inf for all domains, then fill known scores
-            scores = torch.full(
-                (num_domains,),
-                float("-inf"),
-                device=self.device,
-            )
-
-            for m in routing_result.metrics:
-                idx = name_to_idx.get(m.name)
-                if idx is not None:
-                    scores[idx] = float(m.score)
-
-            # Ensure the base/general domain is always at least neutral
-            if not torch.isfinite(scores[0]):
-                scores[0] = 0.0
-
-            # Top-K over specialists only (indices 1..num_domains-1)
-            k = getattr(config, "ROUTER_TOP_K_ADVISORS", 3)
-            k = max(0, min(k, num_specialists))
-
-            domain_mask_vec = torch.zeros(
-                num_domains,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            domain_mask_vec[0] = 1.0  # always include base
-
-            if k > 0 and num_specialists > 0:
-                spec_scores = scores[1:]  # [num_specialists]
-                top_vals, top_idx = torch.topk(
-                    spec_scores,
-                    k=min(k, num_specialists),
-                )
-                for v, idx_rel in zip(top_vals, top_idx):
-                    if torch.isfinite(v):
-                        domain_mask_vec[1 + int(idx_rel.item())] = 1.0
-
-            # Build a soft prior only over allowed domains
-            masked_scores = scores.clone()
-            masked_scores[domain_mask_vec == 0] = float("-inf")
-            prior_vec = torch.softmax(masked_scores, dim=0)
-
-            # Shape to [1, num_domains] so it can be broadcast across batch
-            domain_prior = prior_vec.unsqueeze(0)
-            domain_mask = domain_mask_vec.unsqueeze(0)
-
-        # ---------------------------------------------------------------------
-        # 3) Autoregressive generation, steered by domain_prior/domain_mask
-        # ---------------------------------------------------------------------
         generated_ids: List[int] = input_ids.copy()
 
         for _ in range(max_new_tokens):
@@ -1094,13 +879,7 @@ class ModelManager:
             attention_mask = (context_tensor != self.tokenizer.pad_id).long()
 
             with torch.no_grad():
-                # NOTE: shift_model must accept domain_prior/domain_mask kwargs
-                logits = self.shift_model(
-                    context_tensor,
-                    attention_mask=attention_mask,
-                    domain_prior=domain_prior,
-                    domain_mask=domain_mask,
-                )
+                logits = self.shift_model(context_tensor, attention_mask=attention_mask)
                 next_token_logits = logits[0, -1, :]
 
             if temperature <= 0:
@@ -1117,7 +896,7 @@ class ModelManager:
 
                 probs = torch.softmax(logits_filtered, dim=-1)
                 next_token_id = int(torch.multinomial(probs, num_samples=1).item())
-                # What if we use softmax to find which heads to invoke and sigmoid to have them work together for generation?
+
             generated_ids.append(next_token_id)
 
             if next_token_id == self.tokenizer.eos_id:
@@ -1127,23 +906,21 @@ class ModelManager:
         completion_ids = generated_ids[len(input_ids) :]
         completion_text = self.tokenizer.decode(completion_ids, skip_specials=True)
 
-        self._log_input_output(
-            prompt=prompt,
-            completion=completion_text,
-            query_embedding=query_embedding,
-            routing_result=routing_result,
-            domain_prior=domain_prior,
-            domain_mask=domain_mask,
+        # Routing + emergent handling
+        base_input_ids_tensor = torch.tensor(
+            input_ids,
+            dtype=torch.long,
+            device=self.device,
         )
+        query_embedding = self._compute_query_embedding(base_input_ids_tensor)
 
+        routing_result: Optional[RoutingResult] = None
+        if self.specialist_names:
+            routing_result = self.router.route(query_embedding)
 
-        # ---------------------------------------------------------------------
-        # 4) Emergent handling: unchanged logic
-        # [this is placeholder logic and not correct. Agentic or Human-in-the-loop specialist creation required]
-        # ---------------------------------------------------------------------
-        if (not self.specialist_names) or (
-            routing_result is not None and routing_result.is_unknown
-        ):
+        # If there are no specialists OR router says "unknown_domain",
+        # treat this as emergent and auto-collect.
+        if (not self.specialist_names) or (routing_result is not None and routing_result.is_unknown):
             self._handle_emergent_query(
                 prompt=prompt,
                 completion=completion_text,
@@ -1156,7 +933,7 @@ class ModelManager:
             "completion": completion_text,
             "full_text": full_text,
         }
-    
+
 
 # Global singleton manager for the API
 model_manager = ModelManager()

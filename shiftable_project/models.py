@@ -49,6 +49,11 @@ class BaseTransformerLM(nn.Module):
         self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=n_layers)
         self.lm_head = nn.Linear(d_model, vocab_size)
 
+        # Expose per-layer self-attention modules so ShiftableTransformerLM.from_base_model
+        # can clone and freeze them. This assumes the encoder is a standard
+        # nn.TransformerEncoder with a .layers ModuleList, each having .self_attn.
+        self.self_attns = nn.ModuleList([layer.self_attn for layer in self.encoder.layers])
+
     def forward(
         self,
         input_ids: torch.Tensor,
@@ -179,11 +184,14 @@ class ShiftableTransformerLM(nn.Module):
         )
     
     def forward(
-        self,
-        input_ids: torch.Tensor,
-        attention_mask: Optional[torch.Tensor] = None,
-        return_gates: bool = False,
-    ):
+            self,
+            input_ids: torch.Tensor,
+            attention_mask: Optional[torch.Tensor] = None,
+            return_gates: bool = False,
+            domain_prior: Optional[torch.Tensor] = None,
+            domain_mask: Optional[torch.Tensor] = None,
+        ) -> tuple[torch.Tensor, Optional[list[torch.Tensor]]]:
+
         """
         Args:
             input_ids: [batch, seq_len]
@@ -214,6 +222,8 @@ class ShiftableTransformerLM(nn.Module):
                 attn_mask=None,
                 key_padding_mask=key_padding_mask,
                 return_gate=return_gates,
+                domain_prior=domain_prior,
+                domain_mask=domain_mask,
             )
             if return_gates:
                 all_gates.append(gate)

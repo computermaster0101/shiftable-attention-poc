@@ -1,4 +1,4 @@
-from typing import Optional
+from typing import Optional, Tuple
 
 import torch
 import torch.nn as nn
@@ -62,13 +62,15 @@ class ShiftableTransformerBlock(nn.Module):
         attn_mask: Optional[torch.Tensor] = None,
         key_padding_mask: Optional[torch.Tensor] = None,
         return_gate: bool = False,
-    ):
+        domain_prior: Optional[torch.Tensor] = None,
+        domain_mask: Optional[torch.Tensor] = None,
+    ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
             x: [batch, seq_len, d_model]
         Returns:
             x_out: [batch, seq_len, d_model]
-            gate (optional): [batch, num_domains]
+            gate (optional): [batch, num_domains] from the SMA gate
         """
         # Self-attention with shiftable attention
         x_norm = self.norm1(x)
@@ -76,11 +78,13 @@ class ShiftableTransformerBlock(nn.Module):
             x_norm,
             attn_mask=attn_mask,
             key_padding_mask=key_padding_mask,
-            return_gate=True,
+            return_gate=return_gate,
+            domain_prior=domain_prior,
+            domain_mask=domain_mask,
         )
         x = x + self.dropout(attn_out)
 
-        # FFN
+        # Feedforward
         x_norm2 = self.norm2(x)
         ffn_out = self.ffn(x_norm2)
         x = x + self.dropout(ffn_out)
