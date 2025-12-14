@@ -126,23 +126,50 @@ class ShiftableMultiheadAttention(nn.Module):
         x: torch.Tensor,
         attn_mask: Optional[torch.Tensor],
         key_padding_mask: Optional[torch.Tensor],
-    ) -> List[torch.Tensor]:
+        selected_indices: Optional[List[int]] = None,
+    ) -> tuple[List[int], List[torch.Tensor]]:
         """
-        Run all specialist MHA modules.
+        Run a *selected* subset of specialist MHA modules.
+
+        This is the key change that turns "sparse cooperation" (compute-all-then-blend)
+        into "sparse selection" (only compute the selected experts).
+
+        Args:
+            x: [batch, seq_len, d_model]
+            attn_mask: optional attention mask.
+            key_padding_mask: [batch, seq_len] mask for padding positions.
+            selected_indices: indices into self.spec_mhas to run. If None, runs all.
 
         Returns:
-            List of [batch, seq, d_model], one per specialist.
+            (indices, outs)
+              - indices: the specialist indices that were executed
+              - outs: list of [batch, seq_len, d_model] outputs aligned with indices
         """
+        if selected_indices is None:
+            selected_indices = list(range(len(self.spec_mhas)))
+
         outs: List[torch.Tensor] = []
-        for spec_mha in self.specialist_mhas:
-            out, _ = spec_mha(
-                x, x, x,
-                attn_mask=attn_mask,
-                key_padding_mask=key_padding_mask,
-                need_weights=False,
-            )
+        for i in selected_indices:
+            mha = self.spec_mhas[i]
+            if mha.batch_first:
+                out, _ = mha(
+                    x, x, x,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+            else:
+                x_t = x.transpose(0, 1)
+                out_t, _ = mha(
+                    x_t, x_t, x_t,
+                    attn_mask=attn_mask,
+                    key_padding_mask=key_padding_mask,
+                    need_weights=False,
+                )
+                out = out_t.transpose(0, 1)
             outs.append(out)
-        return outs
+
+        return selected_indices, outs
 
     def forward(
             self,
@@ -160,6 +187,10 @@ class ShiftableMultiheadAttention(nn.Module):
             attn_mask: optional attention mask.
             key_padding_mask: [batch, seq_len] mask for padding positions.
             return_gate: whether to return gate weights.
+            domain_prior: optional geometric prior over domains (base + specialists),
+                         shape [num_domains] or [batch|1, num_domains].
+            domain_mask: optional 0/1 (or bool) mask selecting which domains are allowed,
+                         shape [num_domains] or [batch|1, num_domains].
 
         Returns:
             y: [batch, seq_len, d_model]
@@ -167,19 +198,15 @@ class ShiftableMultiheadAttention(nn.Module):
         """
         bsz, _, _ = x.size()
 
-        # 1) Base output
+        # 1) Base output (always computed)
         base_out = self._run_base_mha(x, attn_mask, key_padding_mask)  # [b, s, d]
 
-        # 2) Specialist outputs
-        spec_outs = self._run_specialists(x, attn_mask, key_padding_mask)  # list of [b, s, d]
-
-        # 3) Compute gate weights over domains
+        # 2) Compute gate logits over domains (learned gate on pooled hidden)
         pooled = self.pool_hidden(x)               # [b, d]
         logits = self.gate(pooled)                 # [b, 1 + num_specialists]
 
-        # Optional: inject geometric prior / mask from DomainRouter.
+        # Optional: inject geometric prior from DomainRouter
         if domain_prior is not None:
-            # domain_prior: [num_domains] or [1, num_domains]
             prior = domain_prior.to(logits.device)
             if prior.dim() == 1:
                 prior = prior.unsqueeze(0)  # [1, num_domains]
@@ -188,28 +215,50 @@ class ShiftableMultiheadAttention(nn.Module):
             prior = torch.clamp(prior, min=eps)
             logits = logits + torch.log(prior)
 
+        # Domain mask is treated as *hard selection*:
+        # - it blocks non-selected domains from contributing to the gate
+        # - and (critically) we will only EXECUTE the selected specialists
+        mask: Optional[torch.Tensor] = None
         if domain_mask is not None:
-            # domain_mask: 0/1 or bool, shape [num_domains] or [1, num_domains]
             mask = domain_mask.to(logits.device)
             if mask.dim() == 1:
                 mask = mask.unsqueeze(0)
             mask = mask.expand_as(logits)
-            # Block masked domains by sending their logits to -inf
             logits = logits.masked_fill(mask == 0, float("-inf"))
 
         # Use sigmoid for independent blend strength, then renormalize so weights sum to 1.
-        # This keeps blending stable while allowing multiple experts to be strongly active.
-        gate_raw = torch.sigmoid(logits)           # [b, 1 + num_specialists]
+        gate_raw = torch.sigmoid(logits)           # [b, num_domains]
+        if mask is not None:
+            gate_raw = gate_raw * mask.to(gate_raw.dtype)
+
         gate = gate_raw / (gate_raw.sum(dim=-1, keepdim=True) + 1e-9)
 
-        # Split gate weights
+        # 3) Decide which specialists to EXECUTE (sparse selection)
+        # Specialists are domains 1..N (domain 0 is base)
+        selected_spec_indices: List[int] = []
+        if mask is not None:
+            # union across batch: run any specialist that is selected for at least one sample
+            spec_mask_any = (mask[:, 1:] > 0).any(dim=0)  # [num_specialists]
+            selected_spec_indices = spec_mask_any.nonzero(as_tuple=False).view(-1).tolist()
+        else:
+            # No explicit mask -> fall back to computing all specialists (dense)
+            selected_spec_indices = list(range(len(self.spec_mhas)))
+
+        # 4) Execute only selected specialists
+        spec_indices_run, spec_outs = self._run_specialists(
+            x,
+            attn_mask,
+            key_padding_mask,
+            selected_indices=selected_spec_indices if selected_spec_indices else [],
+        )
+
+        # 5) Blend outputs
         g_base = gate[:, 0].view(bsz, 1, 1)        # [b, 1, 1]
         g_specs = gate[:, 1:]                      # [b, num_specialists]
 
-        # 4) Blend outputs (attention shift)
         y = g_base * base_out                      # [b, s, d]
-        for i, spec_out in enumerate(spec_outs):
-            g_i = g_specs[:, i].view(bsz, 1, 1)    # [b, 1, 1]
+        for idx, spec_out in zip(spec_indices_run, spec_outs):
+            g_i = g_specs[:, idx].view(bsz, 1, 1)  # idx indexes specialists (0..num_specialists-1)
             y = y + g_i * spec_out
 
         if return_gate:
