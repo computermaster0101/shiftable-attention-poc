@@ -929,24 +929,36 @@ class ModelManager:
           - domain_prior: soft prior over domains (base + specialists)
           - domain_mask: which domains are allowed (1) vs blocked (0)
 
+        Routing policy (GRCLM-style):
+          1) Softmax over composite scores is used to *rank/select* specialists.
+             We select a set whose cumulative Softmax probability mass reaches
+             ROUTER_TOP_P (default 0.6), capped by ROUTER_TOP_K_ADVISORS.
+          2) Sigmoid over composite scores provides *independent blend strength*
+             for the selected specialists.
+          3) The learned gate (inside shiftable attention) still blends, but is
+             constrained by domain_mask and biased by domain_prior.
+
         Domain index convention:
           idx 0: "general" (base)
           idx i>0: self.specialist_names[i-1]
         """
         assert self.specialist_names is not None
 
+        device = self.device
         num_specialists = len(self.specialist_names)
-        num_domains = 1 + num_specialists  # general + specialists
+        num_domains = 1 + num_specialists
 
         # Map names -> indices
         name_to_idx: Dict[str, int] = {"general": 0}
         for i, name in enumerate(self.specialist_names, start=1):
             name_to_idx[name] = i
 
-        scores = torch.full((num_domains,), float("-inf"))
+        # Composite score vector (base + specialists)
+        scores = torch.full((num_domains,), float("-inf"), device=device, dtype=torch.float32)
+
         # Fill with composite scores from router
         for m in routing_result.metrics:
-            idx = name_to_idx.get(m.domain)
+            idx = name_to_idx.get(getattr(m, "domain", None))
             if idx is not None:
                 scores[idx] = float(m.score)
 
@@ -954,28 +966,95 @@ class ModelManager:
         if not torch.isfinite(scores[0]):
             scores[0] = 0.0
 
-        # Top-K over specialists only (1..num_domains-1)
-        k = getattr(config, "ROUTER_TOP_K_ADVISORS", 3)
-        k = max(0, min(k, num_specialists))
+        # Config knobs (optional)
+        sel_temp = float(getattr(config, "ROUTER_SELECTION_TEMPERATURE", 1.0) or 1.0)
+        blend_temp = float(getattr(config, "ROUTER_BLEND_TEMPERATURE", 1.0) or 1.0)
+        blend_bias = float(getattr(config, "ROUTER_BLEND_BIAS", 0.0) or 0.0)
 
-        domain_mask = torch.zeros(num_domains, dtype=torch.float32)
-        domain_mask[0] = 1.0  # always include base
+        # Selection mass (top-p) and caps
+        top_p = float(getattr(config, "ROUTER_TOP_P", 0.6) or 0.6)
+        top_p = max(0.0, min(1.0, top_p))
 
-        if k > 0 and num_specialists > 0:
-            spec_scores = scores[1:]
-            # Some specialists might still be -inf if router had no stats for them.
-            # torch.topk will still give indices; we'll filter invalid ones.
-            top_vals, top_idx = torch.topk(spec_scores, k=min(k, num_specialists))
-            for v, idx_rel in zip(top_vals, top_idx):
-                if torch.isfinite(v):
-                    domain_mask[1 + int(idx_rel)] = 1.0
+        max_k = int(getattr(config, "ROUTER_TOP_K_ADVISORS", 0) or 0)
+        if max_k <= 0:
+            max_k = num_specialists  # no cap
 
-        # Prior only over allowed domains: softmax on masked scores
-        masked_scores = scores.clone()
-        masked_scores[domain_mask == 0] = float("-inf")
-        domain_prior = torch.softmax(masked_scores, dim=0)
+        min_k = int(getattr(config, "ROUTER_MIN_K", 1) or 1)
+        min_k = max(0, min(min_k, num_specialists))
+
+        # Build mask: base always included
+        domain_mask = torch.zeros((num_domains,), device=device, dtype=torch.float32)
+        domain_mask[0] = 1.0
+
+        # If no specialists, prior is all on base.
+        if num_specialists == 0:
+            domain_prior = torch.zeros((num_domains,), device=device, dtype=torch.float32)
+            domain_prior[0] = 1.0
+            return domain_prior, domain_mask
+
+        # Softmax over specialist scores for selection (ignore -inf -> prob 0)
+        spec_scores = scores[1:].clone()
+        # Temperature scaling (avoid divide-by-zero)
+        if sel_temp <= 0:
+            sel_temp = 1.0
+        spec_probs = torch.softmax(spec_scores / sel_temp, dim=0)
+
+        # Rank specialists by probability
+        sorted_probs, sorted_idx = torch.sort(spec_probs, descending=True)
+
+        selected_rel: list[int] = []
+        cum = 0.0
+        for p, idx_rel in zip(sorted_probs.tolist(), sorted_idx.tolist()):
+            # Skip degenerate / invalid specialists
+            if p <= 0 or not torch.isfinite(spec_scores[idx_rel]):
+                continue
+            selected_rel.append(int(idx_rel))
+            cum += float(p)
+            if len(selected_rel) >= max_k:
+                break
+            if cum >= top_p and len(selected_rel) >= min_k:
+                break
+
+        # Fallback: if nothing selected but we have valid scores, pick best one
+        if not selected_rel:
+            # pick argmax among finite scores
+            finite_mask = torch.isfinite(spec_scores)
+            if torch.any(finite_mask):
+                best = int(torch.argmax(torch.where(finite_mask, spec_probs, torch.tensor(-1.0, device=device))).item())
+                selected_rel = [best]
+
+        # Apply selection to mask (specialists are 1..num_domains-1)
+        for idx_rel in selected_rel:
+            domain_mask[1 + idx_rel] = 1.0
+
+        # Sigmoid blend strength on selected (and base)
+        if blend_temp <= 0:
+            blend_temp = 1.0
+        strengths = torch.sigmoid((scores - blend_bias) / blend_temp)
+
+        # Build prior = (selection_probs * strengths) for selected specialists, plus base strength.
+        domain_prior = torch.zeros((num_domains,), device=device, dtype=torch.float32)
+        domain_prior[0] = strengths[0]  # base participation
+
+        for idx_rel in selected_rel:
+            dom_idx = 1 + idx_rel
+            domain_prior[dom_idx] = spec_probs[idx_rel] * strengths[dom_idx]
+
+        # Normalize prior over allowed domains (avoid all-zero)
+        domain_prior = domain_prior * domain_mask
+        s = float(domain_prior.sum().item())
+        if s > 0:
+            domain_prior = domain_prior / s
+        else:
+            # uniform over allowed domains as last resort
+            allowed = torch.count_nonzero(domain_mask).item()
+            if allowed > 0:
+                domain_prior = domain_mask / float(allowed)
 
         return domain_prior, domain_mask
+
+
+
 
 
     def _compute_query_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -1078,7 +1157,7 @@ class ModelManager:
             )
 
             for m in routing_result.metrics:
-                idx = name_to_idx.get(m.name)
+                idx = name_to_idx.get(getattr(m, 'domain', None))
                 if idx is not None:
                     scores[idx] = float(m.score)
 
@@ -1107,40 +1186,11 @@ class ModelManager:
                     if torch.isfinite(v):
                         domain_mask_vec[1 + int(idx_rel.item())] = 1.0
 
-            # Build a soft prior only over allowed domains.
-            # We separate two roles:
-            #   (a) Softmax over composite scores -> selection distribution (for top-K + routing entropy)
-            #   (b) Sigmoid over composite scores -> independent blend strength within the selected set
-            # The learned gate inside the model will still do token/layer-level blending, but it is
-            # biased by this geometric prior and strictly constrained by domain_mask.
+            # Build a soft prior only over allowed domains
             masked_scores = scores.clone()
             masked_scores[domain_mask_vec == 0] = float("-inf")
+            prior_vec = torch.softmax(masked_scores, dim=0)
 
-            # Temperatures can be added to app.config without requiring code changes.
-            sel_temp = float(getattr(config, "ROUTER_SELECTION_TEMPERATURE", 1.0))
-            blend_temp = float(getattr(config, "ROUTER_BLEND_TEMPERATURE", 1.0))
-            blend_bias = float(getattr(config, "ROUTER_BLEND_BIAS", 0.0))
-            sel_temp = max(sel_temp, 1e-6)
-            blend_temp = max(blend_temp, 1e-6)
-
-            selection_probs = torch.softmax(masked_scores / sel_temp, dim=0)
-
-            # Sigmoid strength: values in (0,1) for allowed domains; 0 for masked-out domains.
-            blend_logits = (masked_scores - blend_bias) / blend_temp
-            blend_strength = torch.sigmoid(blend_logits)
-
-            # Combine: keep relative ranking from Softmax, but scale contribution by Sigmoid strength.
-            prior_vec = selection_probs * blend_strength
-            prior_sum = prior_vec.sum()
-            if not torch.isfinite(prior_sum) or float(prior_sum.item()) <= 0.0:
-                # Fallback to selection distribution (or at worst, default to general).
-                prior_vec = selection_probs
-                prior_sum = prior_vec.sum()
-                if not torch.isfinite(prior_sum) or float(prior_sum.item()) <= 0.0:
-                    prior_vec = torch.zeros_like(selection_probs)
-                    prior_vec[0] = 1.0
-            else:
-                prior_vec = prior_vec / prior_sum
             # Shape to [1, num_domains] so it can be broadcast across batch
             domain_prior = prior_vec.unsqueeze(0)
             domain_mask = domain_mask_vec.unsqueeze(0)

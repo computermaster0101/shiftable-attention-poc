@@ -197,7 +197,10 @@ class ShiftableMultiheadAttention(nn.Module):
             # Block masked domains by sending their logits to -inf
             logits = logits.masked_fill(mask == 0, float("-inf"))
 
-        gate = F.softmax(logits, dim=-1)           # [b, 1 + num_specialists]
+        # Use sigmoid for independent blend strength, then renormalize so weights sum to 1.
+        # This keeps blending stable while allowing multiple experts to be strongly active.
+        gate_raw = torch.sigmoid(logits)           # [b, 1 + num_specialists]
+        gate = gate_raw / (gate_raw.sum(dim=-1, keepdim=True) + 1e-9)
 
         # Split gate weights
         g_base = gate[:, 0].view(bsz, 1, 1)        # [b, 1, 1]
