@@ -946,7 +946,7 @@ class ModelManager:
         scores = torch.full((num_domains,), float("-inf"))
         # Fill with composite scores from router
         for m in routing_result.metrics:
-            idx = name_to_idx.get(m.name)
+            idx = name_to_idx.get(m.domain)
             if idx is not None:
                 scores[idx] = float(m.score)
 
@@ -1107,11 +1107,40 @@ class ModelManager:
                     if torch.isfinite(v):
                         domain_mask_vec[1 + int(idx_rel.item())] = 1.0
 
-            # Build a soft prior only over allowed domains
+            # Build a soft prior only over allowed domains.
+            # We separate two roles:
+            #   (a) Softmax over composite scores -> selection distribution (for top-K + routing entropy)
+            #   (b) Sigmoid over composite scores -> independent blend strength within the selected set
+            # The learned gate inside the model will still do token/layer-level blending, but it is
+            # biased by this geometric prior and strictly constrained by domain_mask.
             masked_scores = scores.clone()
             masked_scores[domain_mask_vec == 0] = float("-inf")
-            prior_vec = torch.softmax(masked_scores, dim=0)
 
+            # Temperatures can be added to app.config without requiring code changes.
+            sel_temp = float(getattr(config, "ROUTER_SELECTION_TEMPERATURE", 1.0))
+            blend_temp = float(getattr(config, "ROUTER_BLEND_TEMPERATURE", 1.0))
+            blend_bias = float(getattr(config, "ROUTER_BLEND_BIAS", 0.0))
+            sel_temp = max(sel_temp, 1e-6)
+            blend_temp = max(blend_temp, 1e-6)
+
+            selection_probs = torch.softmax(masked_scores / sel_temp, dim=0)
+
+            # Sigmoid strength: values in (0,1) for allowed domains; 0 for masked-out domains.
+            blend_logits = (masked_scores - blend_bias) / blend_temp
+            blend_strength = torch.sigmoid(blend_logits)
+
+            # Combine: keep relative ranking from Softmax, but scale contribution by Sigmoid strength.
+            prior_vec = selection_probs * blend_strength
+            prior_sum = prior_vec.sum()
+            if not torch.isfinite(prior_sum) or float(prior_sum.item()) <= 0.0:
+                # Fallback to selection distribution (or at worst, default to general).
+                prior_vec = selection_probs
+                prior_sum = prior_vec.sum()
+                if not torch.isfinite(prior_sum) or float(prior_sum.item()) <= 0.0:
+                    prior_vec = torch.zeros_like(selection_probs)
+                    prior_vec[0] = 1.0
+            else:
+                prior_vec = prior_vec / prior_sum
             # Shape to [1, num_domains] so it can be broadcast across batch
             domain_prior = prior_vec.unsqueeze(0)
             domain_mask = domain_mask_vec.unsqueeze(0)
