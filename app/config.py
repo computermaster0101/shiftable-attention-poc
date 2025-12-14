@@ -150,6 +150,20 @@ ROUTER_DELTA = 0.0
 ROUTER_UNKNOWN_MAX_SIM = -1.0
 ROUTER_UNKNOWN_MIN_DIST = 1e9
 
+# ---------------------------------------------------------------------
+# Router covariance regularization
+# ---------------------------------------------------------------------
+# Small diagonal regularization term added to each domain covariance
+# matrix (Σ_k + λI) when computing Mahalanobis distance.
+#
+# This ensures numerical stability, keeps covariance matrices
+# positive-definite, and prevents overconfident routing when
+# domain sample counts are small.
+#
+# Matches GRCLM PDF: Cov_k = E[xxᵀ] − μμᵀ + λI
+ROUTER_COV_LAMBDA = 1e-3
+
+
 # --------------------------------------------------------------------- #
 # Emergent expert configuration
 # --------------------------------------------------------------------- #

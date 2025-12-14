@@ -443,7 +443,9 @@ class ModelManager:
 
                 count_tokens = 0
                 sum_vec = torch.zeros(d_model, dtype=torch.float64, device=self.device)
-                sum_sq_vec = torch.zeros(d_model, dtype=torch.float64, device=self.device)
+
+                # Full second-moment accumulator: Σ (x xᵀ)
+                sum_outer = torch.zeros((d_model, d_model), dtype=torch.float64, device=self.device)
 
                 for path in file_paths:
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -462,23 +464,63 @@ class ModelManager:
                             valid_ids = input_ids[mask]
                             # Token embeddings from the generalist
                             emb = base_model.tok_emb(valid_ids)  # [num_tokens, d_model]
-                            sum_vec += emb.sum(dim=0).double()
-                            sum_sq_vec += (emb.double() * emb.double()).sum(dim=0)
+                            emb64 = emb.double()
+
+                            sum_vec += emb64.sum(dim=0)
+
+                            # Accumulate Σ (x xᵀ) over tokens
+                            sum_outer += emb64.T @ emb64
+
                             count_tokens += int(mask.sum().item())
 
                 if count_tokens == 0:
                     logger.warning("Domain '%s' had no valid tokens; skipping stats.", domain)
                     continue
 
-                mean = (sum_vec / count_tokens).float()
-                var = (sum_sq_vec / count_tokens - (mean.double() * mean.double())).float()
-                var = torch.clamp(var, min=config.ROUTER_MIN_VAR)
+                # Mean (centroid)
+                mean64 = (sum_vec / count_tokens)  # float64
+                mean = mean64.float()
+
+                # Full covariance: Cov = E[xxᵀ] - μ μᵀ, with Bessel correction (~ / (N-1))
+                denom = max(count_tokens - 1, 1)
+
+                ExxT = sum_outer / denom
+                mu = mean64.unsqueeze(1)  # [d, 1]
+                cov = ExxT - (mu @ mu.T)
+
+                # Regularization term λI (PDF uses + λI for stability)
+                # Add this to app/config.py if you prefer: ROUTER_COV_LAMBDA = 1e-3
+                lambda_reg = getattr(config, "ROUTER_COV_LAMBDA", 1e-3)
+                cov = cov + (lambda_reg * torch.eye(d_model, dtype=torch.float64, device=self.device))
+
+                # Ensure diagonal isn’t too small (keeps cov PSD-ish when data is weak)
+                diag = torch.diagonal(cov)
+                diag_clamped = torch.clamp(diag, min=config.ROUTER_MIN_VAR)
+                cov = cov.clone()
+                cov[range(d_model), range(d_model)] = diag_clamped
+
+                # Optional: store Cholesky factor for stable Mahalanobis solves
+                # (Router can compute distance by solving Lx=(q-μ), then ||x||)
+                try:
+                    cov_chol = torch.linalg.cholesky(cov)
+                    cov_chol_out = cov_chol.float().cpu().tolist()
+                except Exception:
+                    cov_chol_out = None
+
+                # Router currently expects a diagonal variance vector ("var_diag").
+                # We already clamped the covariance diagonal above via diag_clamped.
+                var_diag_out = diag_clamped.float().cpu().tolist()
 
                 stats[domain] = {
                     "count": int(count_tokens),
                     "centroid": mean.cpu().tolist(),
-                    "var_diag": var.cpu().tolist(),
+                    "var_diag": var_diag_out,                
+                    "cov": cov.float().cpu().tolist(),       # keep full covariance for future upgrades
+                    "cov_lambda": float(lambda_reg),
+                    "cov_chol": cov_chol_out,
                 }
+
+
                 logger.info(
                     "Domain '%s' stats: tokens=%d, mean_norm=%.4f",
                     domain,

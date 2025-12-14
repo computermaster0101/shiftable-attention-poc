@@ -14,22 +14,20 @@ from . import config
 @dataclass
 class DomainMetrics:
     """
-    Per-domain routing metrics used by the geometric router.
+    Per-domain metrics computed for a single query embedding q.
 
-    Attributes:
-        name:
-            Domain / specialist name.
-
+    Fields:
+        domain:
+            Domain name / specialist key.
         similarity:
-            Cosine similarity s_k(q) between the query embedding and the
-            domain centroid. This is always in [-1, 1].
-
+            Cosine similarity s_k(q) between query embedding and centroid.
         mahalanobis:
-            Mahalanobis distance m_k(q) using a diagonal covariance
-            approximation:
-                m_k(q)^2 = (q - c_k)^T Σ_k^{-1} (q - c_k)
-            where Σ_k is represented by its diagonal var_diag.
-
+            Mahalanobis distance m_k(q). Uses:
+              - full covariance via Cholesky factor if available ("chol")
+              - diagonal variance fallback if available ("diag")
+              - large sentinel if neither available ("none")
+        mahalanobis_source:
+            One of {"chol", "diag", "none"} indicating how mahalanobis was computed.
         entropy:
             An entropy-like uncertainty term H_k(q). In the GRCLM paper this
             corresponds to predictive entropy for specialist k. In this POC
@@ -38,26 +36,16 @@ class DomainMetrics:
                 p_k = (s_k + 1) / 2
                 H_k(q) = -[p_k log p_k + (1 - p_k) log(1 - p_k)]
             which is 0 when similarity is extreme and maximal around 0.
-
         support:
-            Support ratio r_k computed from a sliding window over recent
-            routed queries:
-                r_k = N_k / sum_j N_j
-            where N_k is the count of queries routed to domain k in the
-            current window.
-
+            Support ratio r_k over a sliding routing window.
         score:
-            Composite routing score R_k(q):
-                R_k(q) = α s_k(q)
-                          - β m_k(q)
-                          - γ H_k(q)
-                          + δ r_k
-            where α, β, γ, δ come from app.config.
+            Composite routing score R_k(q) = α s - β m - γ H + δ r
     """
 
-    name: str
+    domain: str
     similarity: float
     mahalanobis: float
+    mahalanobis_source: str
     entropy: float
     support: float
     score: float
@@ -66,9 +54,9 @@ class DomainMetrics:
 @dataclass
 class RoutingResult:
     """
-    Full routing result for a query.
+    Router output for a query.
 
-    Attributes:
+    Fields:
         metrics:
             Per-domain metrics (one DomainMetrics per known domain).
         best_domain:
@@ -92,52 +80,42 @@ class RoutingResult:
 
 class DomainRouter:
     """
-    Geometric router over domains/specialists.
+    DomainRouter computes geometric routing signals and selects (or rejects)
+    a best matching domain.
 
-    It combines:
-      - centroid-based cosine similarity
-      - diagonal Mahalanobis distance
-      - an entropy-like term derived from similarity
-      - a support ratio based on recent routing history
+    Metrics implemented:
+        similarity:
+            Cosine similarity between the query embedding and the
+            domain centroid.
 
-    to compute a composite score R_k(q) per domain, and also checks for
-    "unknown domain" conditions as described in the GRCLM implementation
-    document.
+        mahalanobis:
+            Mahalanobis distance computed as:
+                m^2 = (q - c)^T Σ^{-1} (q - c)
+            Using a Cholesky factor L of Σ (Σ = L L^T):
+                m^2 = || L^{-1}(q - c) ||^2
+
+            Fallback: diagonal approximation using var_diag if no cov/cov_chol exists.
+
+        entropy:
+            Proxy uncertainty term derived from similarity (Bernoulli entropy).
+
+        support:
+            Support ratio computed from a sliding window over recent routed queries.
+
+        score:
+            Composite routing score:
+                R_k(q) = α s_k(q) - β m_k(q) - γ H_k(q) + δ r_k
     """
 
-    def __init__(self, stats_path: Path, device: torch.device) -> None:
-        """
-        Args:
-            stats_path:
-                Path to a JSON file containing domain statistics produced by
-                ModelManager._build_domain_stats().
+    def __init__(self, stats_path: Optional[str] = None) -> None:
+        self.stats_path = Path(
+            stats_path if stats_path is not None else getattr(config, "DOMAIN_STATS_PATH", "domain_stats.json")
+        )
 
-                The expected structure is:
-
-                {
-                  "dim": <int>,                # optional
-                  "domains": {
-                    "<domain_name>": {
-                      "count": <int>,
-                      "centroid": [float, ...],
-                      "var_diag": [float, ...]
-                    },
-                    ...
-                  }
-                }
-
-                If "dim" is not present, the dimension will be inferred from
-                the centroid length.
-
-            device:
-                torch.device where routing tensors should live.
-        """
-        self.stats_path = Path(stats_path)
-        self.device = device
-
-        # Domain centroids and inverse diagonal variances
+        # Domain stats
         self.centroids: Dict[str, torch.Tensor] = {}
-        self.inv_var_diag: Dict[str, torch.Tensor] = {}
+        self.cov_chol: Dict[str, torch.Tensor] = {}      # Lower-triangular Cholesky factor per domain
+        self.inv_var_diag: Dict[str, torch.Tensor] = {}  # Diagonal fallback (1/var)
         self.dim: Optional[int] = None
 
         # Sliding-window support tracking for r_k (Eq. 6).
@@ -153,13 +131,20 @@ class DomainRouter:
 
     def _load_stats(self) -> None:
         """
-        Load domain centroids and diagonal variances from stats_path.
+        Load domain stats from JSON.
 
-        This is designed to be robust to minor format changes:
-        - If "dim" is missing, we infer it from the first centroid.
-        - If the root object is already the domain map, we handle that too.
+        Supports both formats:
+        - {"dim": d, "domains": {...}}
+        - {...} where root is already the domain map
+
+        Each domain entry may include:
+            - centroid: [d]
+            - cov_chol: [[d x d]]  (preferred)
+            - cov: [[d x d]]       (fallback; we compute chol)
+            - var_diag: [d]        (diagonal fallback)
         """
         self.centroids.clear()
+        self.cov_chol.clear()
         self.inv_var_diag.clear()
         self.dim = None
 
@@ -173,29 +158,78 @@ class DomainRouter:
             # If the stats file is corrupt, treat as empty.
             return
 
-        # Support both {"domains": {...}} and {...} directly.
-        domains_obj = obj.get("domains", obj)
+        if isinstance(obj, dict) and "domains" in obj and isinstance(obj["domains"], dict):
+            domain_map = obj["domains"]
+        elif isinstance(obj, dict):
+            domain_map = obj
+        else:
+            return
 
-        for name, stats in domains_obj.items():
-            if not isinstance(stats, dict):
-                continue
-            centroid = stats.get("centroid")
-            var_diag = stats.get("var_diag")
-            if centroid is None or var_diag is None:
-                continue
+        # Optional configured covariance jitter (helps if cov is nearly singular)
+        cov_jitter = float(getattr(config, "ROUTER_COV_LAMBDA", 1e-6))
 
-            c = torch.tensor(centroid, dtype=torch.float32, device=self.device)
-            v = torch.tensor(var_diag, dtype=torch.float32, device=self.device)
-
-            if c.ndim != 1 or v.ndim != 1 or c.shape[0] != v.shape[0]:
+        for name, st in domain_map.items():
+            if not isinstance(st, dict):
                 continue
 
-            inv_v = 1.0 / torch.clamp(v, min=config.ROUTER_MIN_VAR)
+            centroid = st.get("centroid", None)
+            if centroid is None:
+                continue
+
+            try:
+                c = torch.tensor(centroid, dtype=torch.float32)
+            except Exception:
+                continue
+
+            # Load covariance via Cholesky if available
+            L = None
+
+            cov_chol = st.get("cov_chol", None)
+            if cov_chol is not None:
+                try:
+                    L = torch.tensor(cov_chol, dtype=torch.float32)
+                except Exception:
+                    L = None
+
+            if L is None:
+                cov = st.get("cov", None)
+                if cov is not None:
+                    try:
+                        cov_t = torch.tensor(cov, dtype=torch.float32)
+                        # Ensure symmetry-ish (guard against tiny serialization noise)
+                        cov_t = 0.5 * (cov_t + cov_t.transpose(0, 1))
+
+                        # Add jitter to diagonal to guarantee PD if needed
+                        cov_t = cov_t + (cov_jitter * torch.eye(cov_t.shape[0], dtype=cov_t.dtype))
+
+                        # Try Cholesky; if it fails, increase jitter a few times
+                        for k in range(5):
+                            try:
+                                L = torch.linalg.cholesky(cov_t)
+                                break
+                            except Exception:
+                                cov_t = cov_t + ((10.0 ** k) * cov_jitter * torch.eye(cov_t.shape[0], dtype=cov_t.dtype))
+                        # If still None, we fall back to diagonal
+                    except Exception:
+                        L = None
+
+            # Diagonal fallback
+            v = st.get("var_diag", None)
+            inv_v = None
+            if v is not None:
+                try:
+                    v_t = torch.tensor(v, dtype=torch.float32)
+                    inv_v = 1.0 / torch.clamp(v_t, min=getattr(config, "ROUTER_MIN_VAR", 1e-8))
+                except Exception:
+                    inv_v = None
+
             self.centroids[name] = c
-            self.inv_var_diag[name] = inv_v
+            if L is not None:
+                self.cov_chol[name] = L
+            if inv_v is not None:
+                self.inv_var_diag[name] = inv_v
 
         if self.centroids:
-            # Infer dimension from the first centroid
             self.dim = next(iter(self.centroids.values())).shape[0]
 
         # Reset support state whenever stats are rebuilt.
@@ -204,150 +238,100 @@ class DomainRouter:
             self.support_counts = {name: 0 for name in self.centroids.keys()}
 
     def reload(self) -> None:
-        """
-        Reload domain stats from disk.
-
-        Call this after ModelManager rebuilds domain stats (e.g. when
-        specialists are added/removed).
-        """
         self._load_stats()
 
     # ------------------------------------------------------------------ #
-    # Support ratio helpers (Eq. 6)
-    # ------------------------------------------------------------------ #
-
-    def _get_support_ratio(self, domain: str) -> float:
-        """
-        Compute r_k = N_k / sum_j N_j for the given domain based on the
-        current sliding window. Returns 0.0 if there is no history yet.
-        """
-        if self.support_window_size <= 0:
-            return 0.0
-        total = sum(self.support_counts.values())
-        if total <= 0:
-            return 0.0
-        return float(self.support_counts.get(domain, 0)) / float(total)
-
-    def _update_support(self, domain: str) -> None:
-        """
-        Update the sliding-window support counts after routing a query to
-        `domain`.
-        """
-        if self.support_window_size <= 0:
-            return
-
-        self.support_window.append(domain)
-        self.support_counts.setdefault(domain, 0)
-        self.support_counts[domain] += 1
-
-        # Enforce the window size by removing the oldest entry.
-        if len(self.support_window) > self.support_window_size:
-            oldest = self.support_window.pop(0)
-            if oldest in self.support_counts:
-                self.support_counts[oldest] = max(0, self.support_counts[oldest] - 1)
-
-    # ------------------------------------------------------------------ #
-    # Entropy approximation
+    # Metric helpers
     # ------------------------------------------------------------------ #
 
     @staticmethod
-    def _entropy_from_similarity(similarity: float) -> float:
+    def _cosine_similarity(q: torch.Tensor, c: torch.Tensor) -> float:
+        qn = q / (q.norm() + 1e-12)
+        cn = c / (c.norm() + 1e-12)
+        return float(torch.dot(qn, cn).item())
+
+    @staticmethod
+    def _entropy_from_similarity(sim: float) -> float:
+        # Map cosine similarity [-1, 1] -> probability [0, 1]
+        p = (sim + 1.0) / 2.0
+        p = min(max(p, 1e-8), 1.0 - 1e-8)
+        return -float(p * math.log(p) + (1.0 - p) * math.log(1.0 - p))
+
+    def _get_support_ratio(self, name: str) -> float:
+        if self.support_window_size <= 0:
+            return 0.0
+        denom = sum(self.support_counts.values())
+        if denom <= 0:
+            return 0.0
+        return float(self.support_counts.get(name, 0) / denom)
+
+    def _update_support(self, name: str) -> None:
+        if self.support_window_size <= 0:
+            return
+
+        self.support_window.append(name)
+        self.support_counts[name] = self.support_counts.get(name, 0) + 1
+
+        # Pop from left when window exceeds size
+        while len(self.support_window) > self.support_window_size:
+            old = self.support_window.pop(0)
+            self.support_counts[old] = max(0, self.support_counts.get(old, 0) - 1)
+
+    def _mahalanobis_distance(self, name: str, diff: torch.Tensor) -> (float, str):
         """
-        Approximate an entropy-like uncertainty H_k(q) from cosine
-        similarity.
-
-        We map cosine similarity s ∈ [-1, 1] to a Bernoulli probability
-        p ∈ (0, 1) via:
-
-            p = (s + 1) / 2
-
-        and then compute the Bernoulli entropy:
-
-            H(p) = -[p log p + (1 - p) log(1 - p)]
-
-        This is maximal when s ≈ 0 (uncertain / ambiguous) and minimal when
-        s ≈ ±1 (highly certain).
-
-        This is a pragmatic stand-in for true predictive entropy of the
-        specialist, which would require token-level probabilities.
-        """
-        # Map to [0, 1]
-        p = 0.5 * (similarity + 1.0)
-        # Clamp away from 0 and 1 for numerical stability.
-        eps = getattr(config, "ROUTER_EPS", 1e-8)
-        p = min(max(p, eps), 1.0 - eps)
-        return -(
-            p * math.log(p)
-            + (1.0 - p) * math.log(1.0 - p)
-        )
-
-    # ------------------------------------------------------------------ #
-    # Routing (Definitions 2 & 3)
-    # ------------------------------------------------------------------ #
-
-    def route(self, embedding: torch.Tensor) -> RoutingResult:
-        """
-        Compute routing metrics for the given query embedding.
-
-        Args:
-            embedding:
-                1D tensor of shape [dim] representing the query in the same
-                embedding space as the domain centroids.
+        Compute Mahalanobis distance for a given domain from diff = (q - c).
 
         Returns:
-            RoutingResult with per-domain metrics, the best_domain, and an
-            unknown-domain flag.
+            (mahal, source) where source in {"chol", "diag", "none"}.
         """
-        if self.dim is None or not self.centroids:
-            return RoutingResult(
-                metrics=[],
-                best_domain=None,
-                is_unknown=True,
-                reason="no_domain_stats",
-            )
+        # Preferred: full covariance via Cholesky solve
+        L = self.cov_chol.get(name, None)
+        if L is not None:
+            # Solve L z = diff (lower triangular), then m^2 = ||z||^2
+            # diff shape [d]
+            try:
+                z = torch.linalg.solve_triangular(L, diff.unsqueeze(-1), upper=False)
+                m2 = float((z.squeeze(-1) ** 2).sum().item())
+                m2 = max(m2, 0.0)
+                return math.sqrt(m2), "chol"
+            except Exception:
+                # fall through to diag
+                pass
 
-        if embedding.ndim != 1:
-            raise ValueError(
-                f"DomainRouter.route expects a 1D embedding, got shape {tuple(embedding.shape)}"
-            )
+        inv_var = self.inv_var_diag.get(name, None)
+        if inv_var is not None:
+            try:
+                m2 = float(((diff * diff) * inv_var).sum().item())
+                m2 = max(m2, 0.0)
+                return math.sqrt(m2), "diag"
+            except Exception:
+                pass
 
-        q = embedding.to(self.device)
-        if q.shape[0] != self.dim:
-            raise ValueError(
-                f"DomainRouter.route embedding dim mismatch: expected {self.dim}, got {q.shape[0]}"
-            )
+        # No covariance info available -> make distance huge so it won't be selected
+        return float(getattr(config, "ROUTER_NO_COV_PENALTY", 1e9)), "none"
 
-        # Normalize query for cosine similarity
-        q_norm = q.norm(p=2).clamp_min(config.ROUTER_EPS)
-        q_hat = q / q_norm
+    # ------------------------------------------------------------------ #
+    # Main routing
+    # ------------------------------------------------------------------ #
 
+    def route(self, q: torch.Tensor) -> RoutingResult:
+        """
+        Route a query embedding q to the best matching domain, or declare unknown.
+
+        q should be a 1D tensor [d].
+        """
         metrics: List[DomainMetrics] = []
-        best_domain: Optional[str] = None
-        best_score: float = -float("inf")
 
         # Compute per-domain metrics
         for name, c in self.centroids.items():
-            c_norm = c.norm(p=2).clamp_min(config.ROUTER_EPS)
-            c_hat = c / c_norm
+            sim = self._cosine_similarity(q, c)
 
-            # Cosine similarity s_k(q)
-            sim = float(torch.dot(q_hat, c_hat).item())
-
-            # Mahalanobis distance m_k(q) with diagonal covariance
-            inv_var = self.inv_var_diag[name]
             diff = q - c
-            m2 = float(((diff * diff) * inv_var).sum().item())
-            if m2 < 0.0:
-                m2 = 0.0
-            mahal = math.sqrt(m2)
+            mahal, msrc = self._mahalanobis_distance(name, diff)
 
-            # Entropy-like uncertainty H_k(q)
             entropy = self._entropy_from_similarity(sim)
-
-            # Support ratio r_k
             support = self._get_support_ratio(name)
 
-            # Composite score R_k(q)
             score = (
                 config.ROUTER_ALPHA * sim
                 - config.ROUTER_BETA * mahal
@@ -355,20 +339,19 @@ class DomainRouter:
                 + config.ROUTER_DELTA * support
             )
 
-            dm = DomainMetrics(
-                name=name,
-                similarity=float(sim),
-                mahalanobis=float(mahal),
-                entropy=float(entropy),
-                support=float(support),
-                score=float(score),
+            metrics.append(
+                DomainMetrics(
+                    domain=name,
+                    similarity=sim,
+                    mahalanobis=mahal,
+                    mahalanobis_source=msrc,
+                    entropy=entropy,
+                    support=support,
+                    score=score,
+                )
             )
-            metrics.append(dm)
 
-            if score > best_score:
-                best_score = score
-                best_domain = name
-
+        # If no stats, treat as unknown
         if not metrics:
             return RoutingResult(
                 metrics=[],
@@ -377,7 +360,11 @@ class DomainRouter:
                 reason="no_domain_stats",
             )
 
-        # Unknown-domain checks (Definition 3 style)
+        # Pick best domain by composite score
+        metrics.sort(key=lambda m: m.score, reverse=True)
+        best_domain = metrics[0].domain if metrics else None
+
+        # Unknown-domain checks
         max_sim = max(m.similarity for m in metrics)
         min_dist = min(m.mahalanobis for m in metrics)
         min_entropy = min(m.entropy for m in metrics)
@@ -393,34 +380,26 @@ class DomainRouter:
         entropy_term = False
         max_entropy_thr = getattr(config, "ROUTER_UNKNOWN_MAX_ENTROPY", None)
         if max_entropy_thr is not None:
-            entropy_term = min_entropy > max_entropy_thr
+            entropy_term = min_entropy > float(max_entropy_thr)
 
-        # Optional support term, with warm-up + only when multiple domains
+        # Optional support term
         support_term = False
-        min_support_thr = getattr(config, "ROUTER_UNKNOWN_MIN_SUPPORT", 0.0)
-        if (not phase_general_only) and min_support_thr > 0.0:
-            total_support = sum(self.support_counts.values())
-            warmup_min_events = getattr(config, "ROUTER_SUPPORT_WARMUP_MIN_EVENTS", 0)
-            if total_support >= warmup_min_events:
-                support_term = max_support < min_support_thr
-            else:
-                support_term = False  # disable support-based unknown during warm-up
+        min_support_thr = getattr(config, "ROUTER_UNKNOWN_MIN_SUPPORT", None)
+        if min_support_thr is not None:
+            support_term = max_support < float(min_support_thr)
 
-        if phase_general_only:
-            # Phase 0: general-only. Everything is unknown unless very close to training data.
-            # Here we deliberately ignore support and (optionally) similarity.
-            is_unknown = dist_term or entropy_term
-        else:
-            # Phase 1+: multi-domain. Full composite logic.
-            is_unknown = sim_term or dist_term or entropy_term or support_term
+        # Conservative disjunction: unknown if any strong signal says "novel"
+        is_unknown = (sim_term or dist_term or entropy_term or support_term)
+
+        # Don't declare unknown in "general-only" phase unless explicitly allowed
+        if phase_general_only and not getattr(config, "ROUTER_ALLOW_UNKNOWN_WITH_ONLY_GENERAL", False):
+            is_unknown = False
 
         # Update support history only for routed (non-unknown) queries.
         if not is_unknown and best_domain is not None:
             self._update_support(best_domain)
 
-        reason = "ok"
-        if is_unknown:
-            reason = "unknown_domain"
+        reason = "ok" if not is_unknown else "unknown_domain"
 
         return RoutingResult(
             metrics=metrics,
