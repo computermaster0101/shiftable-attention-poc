@@ -302,5 +302,11 @@ ROUTER_SUPPORT_WINDOW = 1024
 # all domains and everything is permanently marked unknown.
 ROUTER_SUPPORT_WARMUP_MIN_EVENTS = 128
 
+
+# --- Learned blend correction (Policy B: geometry + small learned correction) ---
+# Combine logits as: alpha * log(domain_prior) + beta * learned_gate_logits
+# Use alpha >> beta to keep geometry dominant.
+GATE_GEOMETRY_ALPHA = 6.0
+GATE_LEARNED_BETA = 1.0
 # How many specialist advisors (besides base) to invite per query
 ROUTER_TOP_K_ADVISORS = 3

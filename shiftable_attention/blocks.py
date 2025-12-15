@@ -64,6 +64,7 @@ class ShiftableTransformerBlock(nn.Module):
         return_gate: bool = False,
         domain_prior: Optional[torch.Tensor] = None,
         domain_mask: Optional[torch.Tensor] = None,
+            domain_weights: Optional[torch.Tensor] = None,
     ) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
         """
         Args:
@@ -81,6 +82,7 @@ class ShiftableTransformerBlock(nn.Module):
             return_gate=return_gate,
             domain_prior=domain_prior,
             domain_mask=domain_mask,
+            domain_weights=domain_weights,
         )
         x = x + self.dropout(attn_out)
 

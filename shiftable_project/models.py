@@ -6,6 +6,7 @@ import torch
 import torch.nn as nn
 
 from shiftable_attention import ShiftableTransformerBlock
+from shiftable_attention.gate import DomainGate
 
 
 class BaseTransformerLM(nn.Module):
@@ -180,6 +181,10 @@ class ShiftableTransformerLM(nn.Module):
 
         self.specialist_names = specialist_names
 
+        # shared learned correction gate (computed once per prompt)
+        self.num_domains = 1 + num_specialists
+        self.blend_gate = DomainGate(d_model=d_model, num_domains=self.num_domains)
+
         self.tok_emb = nn.Embedding(vocab_size, d_model, padding_idx=pad_id)
         self.pos_emb = nn.Embedding(max_seq_len, d_model)
 
@@ -230,6 +235,7 @@ class ShiftableTransformerLM(nn.Module):
             return_gates: bool = False,
             domain_prior: Optional[torch.Tensor] = None,
             domain_mask: Optional[torch.Tensor] = None,
+            domain_weights: Optional[torch.Tensor] = None,
         ) -> tuple[torch.Tensor, Optional[list[torch.Tensor]]]:
 
         """
@@ -264,6 +270,7 @@ class ShiftableTransformerLM(nn.Module):
                 return_gate=return_gates,
                 domain_prior=domain_prior,
                 domain_mask=domain_mask,
+                domain_weights=domain_weights,
             )
             if return_gates:
                 all_gates.append(gate)

@@ -1172,6 +1172,8 @@ class ModelManager:
 
         domain_prior: Optional[torch.Tensor] = None  # shape [1, 1 + num_specialists]
         domain_mask: Optional[torch.Tensor] = None   # shape [1, 1 + num_specialists]
+        domain_weights: Optional[torch.Tensor] = None  # shape [1, 1 + num_specialists]
+
 
         # Only build a prior/mask if we have specialists AND the router thinks
         # this query belongs to a known domain.
@@ -1187,6 +1189,28 @@ class ModelManager:
             # Shape to [1, num_domains] so it can be broadcast across batch
             domain_prior = prior_vec.unsqueeze(0)
             domain_mask = mask_vec.unsqueeze(0)
+
+            # compute a fixed (per-prompt) domain weight vector using
+            # geometry prior + a small learned correction gate.
+            domain_weights = None
+            try:
+                alpha = float(getattr(config, "GATE_GEOMETRY_ALPHA", 6.0))
+                beta = float(getattr(config, "GATE_LEARNED_BETA", 1.0))
+
+                # Learned correction gate lives on the shift model (trained lightly when specialists change)
+                if hasattr(self.shift_model, "blend_gate") and callable(getattr(self.shift_model, "blend_gate")):
+                    pooled = query_embedding.unsqueeze(0)  # [1, d_model]
+                    g_logits = self.shift_model.blend_gate(pooled)  # [1, num_domains]
+
+                    prior = torch.clamp(domain_prior, min=1e-9)
+                    mix_logits = alpha * torch.log(prior) + beta * g_logits
+
+                    # Enforce sparse selection
+                    mix_logits = mix_logits.masked_fill(domain_mask == 0, float("-inf"))
+                    domain_weights = torch.softmax(mix_logits, dim=-1)
+            except Exception:
+                # If anything goes wrong, fall back to prior-driven per-layer gate
+                domain_weights = None
 
         # ---------------------------------------------------------------------
         # 3) Autoregressive generation, steered by domain_prior/domain_mask
@@ -1214,6 +1238,7 @@ class ModelManager:
                     attention_mask=attention_mask,
                     domain_prior=domain_prior,
                     domain_mask=domain_mask,
+                    domain_weights=domain_weights,
                 )
                 next_token_logits = logits[0, -1, :]
 

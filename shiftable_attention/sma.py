@@ -179,6 +179,7 @@ class ShiftableMultiheadAttention(nn.Module):
             return_gate: bool = False,
             domain_prior: Optional[torch.Tensor] = None,
             domain_mask: Optional[torch.Tensor] = None,
+            domain_weights: Optional[torch.Tensor] = None,
         ) -> tuple[torch.Tensor, Optional[torch.Tensor]]:
 
         """
@@ -202,38 +203,60 @@ class ShiftableMultiheadAttention(nn.Module):
         base_out = self._run_base_mha(x, attn_mask, key_padding_mask)  # [b, s, d]
 
         # 2) Compute gate logits over domains (learned gate on pooled hidden)
-        pooled = self.pool_hidden(x)               # [b, d]
-        logits = self.gate(pooled)                 # [b, 1 + num_specialists]
+        # ------------------------------------------------------------------
+        # Compute gate weights
+        #   - If domain_weights is provided, use it directly (fixed across layers)
+        #   - Else fall back to per-layer learned gate logits (+ optional domain_prior)
+        # ------------------------------------------------------------------
 
-        # Optional: inject geometric prior from DomainRouter
-        if domain_prior is not None:
-            prior = domain_prior.to(logits.device)
-            if prior.dim() == 1:
-                prior = prior.unsqueeze(0)  # [1, num_domains]
-            prior = prior.expand_as(logits)  # [b, num_domains]
-            eps = 1e-8
-            prior = torch.clamp(prior, min=eps)
-            logits = logits + torch.log(prior)
-
-        # Domain mask is treated as *hard selection*:
-        # - it blocks non-selected domains from contributing to the gate
-        # - and (critically) we will only EXECUTE the selected specialists
         mask: Optional[torch.Tensor] = None
         if domain_mask is not None:
-            mask = domain_mask.to(logits.device)
+            mask = domain_mask.to(x.device)
             if mask.dim() == 1:
                 mask = mask.unsqueeze(0)
-            mask = mask.expand_as(logits)
-            logits = logits.masked_fill(mask == 0, float("-inf"))
+            # broadcast across batch
+            if mask.size(0) == 1 and bsz > 1:
+                mask = mask.expand(bsz, -1)
 
-        # Use sigmoid for independent blend strength, then renormalize so weights sum to 1.
-        gate_raw = torch.sigmoid(logits)           # [b, num_domains]
-        if mask is not None:
-            gate_raw = gate_raw * mask.to(gate_raw.dtype)
+        if domain_weights is not None:
+            # domain_weights is expected to be probabilities over domains
+            gate = domain_weights.to(x.device)
+            if gate.dim() == 1:
+                gate = gate.unsqueeze(0)
+            if gate.size(0) == 1 and bsz > 1:
+                gate = gate.expand(bsz, -1)
 
-        gate = gate_raw / (gate_raw.sum(dim=-1, keepdim=True) + 1e-9)
+            if mask is not None:
+                gate = gate * mask.to(gate.dtype)
 
-        # 3) Decide which specialists to EXECUTE (sparse selection)
+            gate = gate / (gate.sum(dim=-1, keepdim=True) + 1e-9)
+
+        else:
+            # 1) Compute learned gate logits from pooled hidden state
+            pooled = self.pool_hidden(x)  # [batch, d_model]
+            logits = self.gate(pooled)    # [batch, num_domains]
+
+            # 2) Inject router prior if provided (log-space bias)
+            if domain_prior is not None:
+                prior = domain_prior.to(logits.device)
+                if prior.dim() == 1:
+                    prior = prior.unsqueeze(0)
+                if prior.size(0) == 1 and bsz > 1:
+                    prior = prior.expand(bsz, -1)
+                prior = torch.clamp(prior, min=1e-9)
+                logits = logits + torch.log(prior)
+
+            # Apply hard mask if provided
+            if mask is not None:
+                logits = logits.masked_fill(mask == 0, float("-inf"))
+
+            # Use sigmoid for independent blend strength, then renormalize
+            gate_raw = torch.sigmoid(logits)
+            if mask is not None:
+                gate_raw = gate_raw * mask.to(gate_raw.dtype)
+
+            gate = gate_raw / (gate_raw.sum(dim=-1, keepdim=True) + 1e-9)
+# 3) Decide which specialists to EXECUTE (sparse selection)
         # Specialists are domains 1..N (domain 0 is base)
         selected_spec_indices: List[int] = []
         if mask is not None:
