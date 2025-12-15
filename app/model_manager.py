@@ -1266,6 +1266,28 @@ class ModelManager:
         completion_ids = generated_ids[len(input_ids) :]
         completion_text = self.tokenizer.decode(completion_ids, skip_specials=True)
 
+
+        # -----------------------------------------------------------------
+        # 3.5) Low-confidence / unknown-domain response policy
+        # If routing is unknown (or there are no specialists), we still log
+        # the sample for emergence, but we *prepend* an explicit disclaimer.
+        # If the model produces an empty completion (e.g., EOS immediately),
+        # we provide a minimal fallback string so the user sees something.
+        # -----------------------------------------------------------------
+        is_low_confidence = (not self.specialist_names) or (
+            routing_result is not None and routing_result.is_unknown
+        )
+        if is_low_confidence:
+            disclaimer = (
+                "I don’t know, but I will log that I need to learn this. "
+                "I have low confidence this is the correct answer:\n\n"
+            )
+            if completion_text.strip() == "":
+                completion_text = "I don't know what to think."
+            completion_text = disclaimer + completion_text
+            # Keep full_text consistent with what we return
+            full_text = prompt + "\n" + completion_text
+
         self._log_input_output(
             prompt=prompt,
             completion=completion_text,
