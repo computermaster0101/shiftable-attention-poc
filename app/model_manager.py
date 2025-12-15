@@ -971,70 +971,127 @@ class ModelManager:
           - domain_prior: soft prior over domains (base + specialists)
           - domain_mask: which domains are allowed (1) vs blocked (0)
 
-        Routing policy (GRCLM-style):
-          1) Softmax over composite scores is used to *rank/select* specialists.
-             We select a set whose cumulative Softmax probability mass reaches
-             ROUTER_TOP_P (default 0.6), capped by ROUTER_TOP_K_ADVISORS.
-          2) Sigmoid over composite scores provides *independent blend strength*
-             for the selected specialists.
-          3) The learned gate (inside shiftable attention) still blends, but is
-             constrained by domain_mask and biased by domain_prior.
+        Policy (GRCLM-style, sparse selection + soft cooperation):
+          1) Use Softmax(composite_score / selection_temp) to RANK specialists.
+             Select a sparse set whose cumulative probability mass reaches TOP_P,
+             bounded by [MIN_K, MAX_K].
+          2) Use Sigmoid(composite_score / sigmoid_temp) to assign *independent*
+             blend strengths for the selected specialists.
+          3) Convert strengths into a proper prior distribution (sums to 1)
+             with base always included.
 
-        Domain index convention:
-          idx 0: "general" (base)
-          idx i>0: self.specialist_names[i-1]
+        Notes:
+          - This function is intentionally lightweight: routing remains geometric.
+          - Predictive entropy (token-distribution uncertainty) is handled later
+            during generation-time calibration, and only over the allowed set.
         """
-        assert self.specialist_names is not None
 
         device = self.device
         num_specialists = len(self.specialist_names)
         num_domains = 1 + num_specialists
 
-        # Map names -> indices
-        name_to_idx: Dict[str, int] = {"general": 0}
-        for i, name in enumerate(self.specialist_names, start=1):
-            name_to_idx[name] = i
-
-        # Composite score vector (base + specialists)
-        scores = torch.full((num_domains,), float("-inf"), device=device, dtype=torch.float32)
-
-        # Fill with composite scores from router
-        for m in routing_result.metrics:
-            idx = name_to_idx.get(getattr(m, "domain", None))
-            if idx is not None:
-                scores[idx] = float(m.score)
-
-        # Always keep base in the game; if it was -inf, give it a neutral score
-        if not torch.isfinite(scores[0]):
-            scores[0] = 0.0
-
-        # Config knobs (optional)
-        sel_temp = float(getattr(config, "ROUTER_SELECTION_TEMPERATURE", 1.0) or 1.0)
-        blend_temp = float(getattr(config, "ROUTER_BLEND_TEMPERATURE", 1.0) or 1.0)
-        blend_bias = float(getattr(config, "ROUTER_BLEND_BIAS", 0.0) or 0.0)
-
-        # Selection mass (top-p) and caps
-        top_p = float(getattr(config, "ROUTER_TOP_P", 0.6) or 0.6)
-        top_p = max(0.0, min(1.0, top_p))
-
-        max_k = int(getattr(config, "ROUTER_TOP_K_ADVISORS", 0) or 0)
-        if max_k <= 0:
-            max_k = num_specialists  # no cap
-
-        min_k = int(getattr(config, "ROUTER_MIN_K", 1) or 1)
-        min_k = max(0, min(min_k, num_specialists))
-
-        # Build mask: base always included
-        domain_mask = torch.zeros((num_domains,), device=device, dtype=torch.float32)
-        domain_mask[0] = 1.0
-
-        # If no specialists, prior is all on base.
-        if num_specialists == 0:
+        # Base-only routing for unknowns (or if no specialists exist)
+        if getattr(routing_result, "is_unknown", False) or num_specialists == 0:
+            domain_mask = torch.zeros((num_domains,), device=device, dtype=torch.float32)
+            domain_mask[0] = 1.0
             domain_prior = torch.zeros((num_domains,), device=device, dtype=torch.float32)
             domain_prior[0] = 1.0
             return domain_prior, domain_mask
 
+        # Resolve config with safe defaults (some configs use slightly different names)
+        selection_temp = float(getattr(config, "ROUTER_SELECTION_TEMPERATURE", 1.0) or 1.0)
+        sigmoid_temp = float(getattr(config, "ROUTER_SIGMOID_TEMPERATURE", 1.0) or 1.0)
+        top_p = float(getattr(config, "ROUTER_TOP_P", 0.6) or 0.6)
+        max_k = int(getattr(config, "ROUTER_TOP_K_ADVISORS", 0) or 0)
+        min_k = int(getattr(config, "ROUTER_MIN_K_ADVISORS", getattr(config, "ROUTER_MIN_K", 1)) or 1)
 
+        # Clamp/guard values
+        if selection_temp <= 0:
+            selection_temp = 1.0
+        if sigmoid_temp <= 0:
+            sigmoid_temp = 1.0
+        top_p = max(0.0, min(1.0, top_p))
+        if max_k <= 0:
+            max_k = num_specialists
+        max_k = min(max_k, num_specialists)
+        min_k = max(0, min(min_k, max_k))
+
+        # Map specialist names -> domain indices
+        name_to_idx: Dict[str, int] = {"general": 0}
+        for i, name in enumerate(self.specialist_names, start=1):
+            name_to_idx[name] = i
+
+        # Build composite score vector (base + specialists). Base has no router metric; keep it 0.
+        scores = torch.full((num_domains,), float("-inf"), device=device, dtype=torch.float32)
+        scores[0] = 0.0
+        for m in getattr(routing_result, "metrics", []):
+            idx = name_to_idx.get(getattr(m, "domain", None))
+            if idx is not None:
+                scores[idx] = float(getattr(m, "score", float("-inf")))
+
+        # Specialist-only scores for selection (exclude base)
+        spec_scores = scores[1:].clone()
+
+        # If no valid specialist scores, fall back to base-only
+        if torch.isneginf(spec_scores).all():
+            domain_mask = torch.zeros((num_domains,), device=device, dtype=torch.float32)
+            domain_mask[0] = 1.0
+            domain_prior = torch.zeros((num_domains,), device=device, dtype=torch.float32)
+            domain_prior[0] = 1.0
+            return domain_prior, domain_mask
+
+        # Softmax ranking probabilities
+        rank_logits = spec_scores / selection_temp
+        rank_probs = torch.softmax(rank_logits, dim=0)
+
+        # Rank indices (0..num_specialists-1) by descending prob
+        order = torch.argsort(rank_probs, descending=True)
+
+        # Select sparse set by cumulative probability mass up to top_p
+        selected_spec: List[int] = []
+        cum = 0.0
+        for j in order.tolist():
+            if torch.isneginf(spec_scores[j]):
+                continue
+            selected_spec.append(j)
+            cum += float(rank_probs[j])
+            if len(selected_spec) >= max_k:
+                break
+            if cum >= top_p and len(selected_spec) >= min_k:
+                break
+
+        # Ensure minimum selection if possible
+        if len(selected_spec) < min_k:
+            for j in order.tolist():
+                if j in selected_spec:
+                    continue
+                if torch.isneginf(spec_scores[j]):
+                    continue
+                selected_spec.append(j)
+                if len(selected_spec) >= min_k or len(selected_spec) >= max_k:
+                    break
+
+        # Build mask (base always included)
+        domain_mask = torch.zeros((num_domains,), device=device, dtype=torch.float32)
+        domain_mask[0] = 1.0
+        for j in selected_spec:
+            domain_mask[1 + j] = 1.0
+
+        # Sigmoid blend strengths (independent)
+        strengths = torch.zeros((num_domains,), device=device, dtype=torch.float32)
+        strengths[0] = 1.0
+        sig = torch.sigmoid(spec_scores / sigmoid_temp)
+        for j in selected_spec:
+            strengths[1 + j] = sig[j]
+
+        # Convert strengths into a proper prior distribution over allowed domains
+        eps = float(getattr(config, "ROUTER_EPS", 1e-8) or 1e-8)
+        strengths = strengths * domain_mask
+        total = strengths.sum().clamp_min(eps)
+        domain_prior = (strengths / total).clamp_min(eps)
+        domain_prior = domain_prior / domain_prior.sum().clamp_min(eps)
+
+        return domain_prior, domain_mask
 
     def _calibrate_domain_weights_with_predictive_entropy(
         self,
