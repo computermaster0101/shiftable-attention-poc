@@ -153,6 +153,7 @@ class ModelManager:
         self.device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
         self.tokenizer: Optional[SimpleTokenizer] = None
         self.shift_model: Optional[ShiftableTransformerLM] = None
+        self.base_model: Optional[BaseTransformerLM] = None
         self.specialist_names: List[str] = []
 
         # Geometric router (uses DOMAIN_STATS_PATH)
@@ -413,15 +414,60 @@ class ModelManager:
         domain_names: List[str],
     ) -> None:
         """
-        Build per-domain statistics (centroid and diagonal covariance) based on
-        token embeddings from the generalist's token embedding matrix.
+        Build per-domain statistics (centroid + covariance) in TRUNK embedding space.
+
+        Before this patch, stats were built from raw token embeddings (tok_emb),
+        which is (a) not the trunk and (b) mismatched against the query embedding
+        space in inference. GRCLM assumes a fixed embedding model E(x) for routing.
+
+        We now compute sentence embeddings q = E(x) using the generalist trunk
+        encoder (BaseTransformerLM.encode), mean-pooled over non-PAD tokens.
+
+        Output JSON schema remains compatible with DomainRouter:
+          - centroid: mean vector
+          - var_diag: diagonal of covariance (clamped)
+          - cov: full covariance (kept for future upgrades)
+          - cov_chol: optional cholesky for stable solves
         """
         base_model = base_model.to(self.device)
         base_model.eval()
-        d_model = base_model.tok_emb.embedding_dim
+        d_model = base_model.d_model
 
         stats: Dict[str, Dict[str, object]] = {}
         total_domains = 0
+
+        batch_size = int(getattr(config, "ROUTER_STATS_BATCH_SIZE", 32))
+        if batch_size <= 0:
+            batch_size = 32
+
+        def _encode_text_batch(text_batch: List[str]) -> torch.Tensor:
+            # Tokenize and pad to batch max length
+            ids_list = [tokenizer.encode(t, add_specials=True) for t in text_batch]
+            ids_list = [ids[: config.MAX_SEQ_LEN] for ids in ids_list if ids]
+            if not ids_list:
+                return torch.empty((0, d_model), device=self.device)
+
+            max_len = max(len(x) for x in ids_list)
+            pad = tokenizer.pad_id
+
+            input_ids = torch.full(
+                (len(ids_list), max_len),
+                pad,
+                dtype=torch.long,
+                device=self.device,
+            )
+            attn = torch.zeros(
+                (len(ids_list), max_len),
+                dtype=torch.long,
+                device=self.device,
+            )
+
+            for i, ids in enumerate(ids_list):
+                n = len(ids)
+                input_ids[i, :n] = torch.tensor(ids, dtype=torch.long, device=self.device)
+                attn[i, :n] = 1
+
+            return base_model.encode(input_ids, attention_mask=attn)  # [B, D]
 
         with torch.no_grad():
             for domain in domain_names:
@@ -439,13 +485,27 @@ class ModelManager:
                     logger.warning("Domain '%s' has no .txt files in %s; skipping.", domain, data_dir)
                     continue
 
-                logger.info("Building domain stats for '%s' from %d files.", domain, len(file_paths))
+                logger.info("Building TRUNK-space domain stats for '%s' from %d files.", domain, len(file_paths))
 
-                count_tokens = 0
+                # Now counts *samples* (lines), not tokens
+                count_samples = 0
                 sum_vec = torch.zeros(d_model, dtype=torch.float64, device=self.device)
-
-                # Full second-moment accumulator: Σ (x xᵀ)
                 sum_outer = torch.zeros((d_model, d_model), dtype=torch.float64, device=self.device)
+
+                batch: List[str] = []
+
+                def _flush_batch() -> None:
+                    nonlocal count_samples, sum_vec, sum_outer, batch
+                    if not batch:
+                        return
+                    embs = _encode_text_batch(batch).double()  # [B,D]
+                    if embs.numel() == 0:
+                        batch = []
+                        return
+                    sum_vec += embs.sum(dim=0)
+                    sum_outer += embs.T @ embs
+                    count_samples += int(embs.shape[0])
+                    batch = []
 
                 for path in file_paths:
                     with open(path, "r", encoding="utf-8", errors="ignore") as f:
@@ -453,78 +513,57 @@ class ModelManager:
                             text = line.strip()
                             if not text:
                                 continue
-                            ids = tokenizer.encode(text, add_specials=True)
-                            if not ids:
-                                continue
-                            input_ids = torch.tensor(ids, dtype=torch.long, device=self.device)
-                            # Exclude PAD tokens
-                            mask = input_ids != tokenizer.pad_id
-                            if mask.sum().item() == 0:
-                                continue
-                            valid_ids = input_ids[mask]
-                            # Token embeddings from the generalist
-                            emb = base_model.tok_emb(valid_ids)  # [num_tokens, d_model]
-                            emb64 = emb.double()
+                            batch.append(text)
+                            if len(batch) >= batch_size:
+                                _flush_batch()
 
-                            sum_vec += emb64.sum(dim=0)
+                _flush_batch()
 
-                            # Accumulate Σ (x xᵀ) over tokens
-                            sum_outer += emb64.T @ emb64
-
-                            count_tokens += int(mask.sum().item())
-
-                if count_tokens == 0:
-                    logger.warning("Domain '%s' had no valid tokens; skipping stats.", domain)
+                if count_samples == 0:
+                    logger.warning("Domain '%s' had no valid samples; skipping stats.", domain)
                     continue
 
                 # Mean (centroid)
-                mean64 = (sum_vec / count_tokens)  # float64
+                mean64 = (sum_vec / count_samples)  # float64
                 mean = mean64.float()
 
-                # Full covariance: Cov = E[xxᵀ] - μ μᵀ, with Bessel correction (~ / (N-1))
-                denom = max(count_tokens - 1, 1)
-
+                # Covariance with Bessel correction (~ / (N-1))
+                denom = max(count_samples - 1, 1)
                 ExxT = sum_outer / denom
                 mu = mean64.unsqueeze(1)  # [d, 1]
                 cov = ExxT - (mu @ mu.T)
 
                 # Regularization term λI (PDF uses + λI for stability)
-                # Add this to app/config.py if you prefer: ROUTER_COV_LAMBDA = 1e-3
                 lambda_reg = getattr(config, "ROUTER_COV_LAMBDA", 1e-3)
                 cov = cov + (lambda_reg * torch.eye(d_model, dtype=torch.float64, device=self.device))
 
-                # Ensure diagonal isn’t too small (keeps cov PSD-ish when data is weak)
+                # Clamp diagonal for numerical stability
                 diag = torch.diagonal(cov)
                 diag_clamped = torch.clamp(diag, min=config.ROUTER_MIN_VAR)
                 cov = cov.clone()
                 cov[range(d_model), range(d_model)] = diag_clamped
 
-                # Optional: store Cholesky factor for stable Mahalanobis solves
-                # (Router can compute distance by solving Lx=(q-μ), then ||x||)
                 try:
                     cov_chol = torch.linalg.cholesky(cov)
                     cov_chol_out = cov_chol.float().cpu().tolist()
                 except Exception:
                     cov_chol_out = None
 
-                # Router currently expects a diagonal variance vector ("var_diag").
-                # We already clamped the covariance diagonal above via diag_clamped.
                 var_diag_out = diag_clamped.float().cpu().tolist()
 
                 stats[domain] = {
-                    "count": int(count_tokens),
+                    "count": int(count_samples),
                     "centroid": mean.cpu().tolist(),
-                    "var_diag": var_diag_out,                
-                    "cov": cov.float().cpu().tolist(),       # keep full covariance for future upgrades
+                    "var_diag": var_diag_out,
+                    "cov": cov.float().cpu().tolist(),
                     "cov_lambda": float(lambda_reg),
                     "cov_chol": cov_chol_out,
                 }
 
-
                 logger.info(
-                    "Domain '%s' stats: tokens=%d, mean_norm=%.4f",
+                    "Domain '%s' stats: samples=%d, mean_norm=%.4f",
                     domain,
-                    count_tokens,
+                    count_samples,
                     float(mean.norm().item()),
                 )
                 total_domains += 1
@@ -557,6 +596,9 @@ class ModelManager:
         cfg: Dict[str, object] = ckpt["config"]
 
         base_model, _ = self._load_generalist_model()
+        base_model = base_model.to(self.device)
+        base_model.eval()
+        self.base_model = base_model
         shift_model = ShiftableTransformerLM.from_base_model(
             base_model,
             num_specialists=int(cfg["num_specialists"]),
@@ -1059,8 +1101,12 @@ class ModelManager:
 
     def _compute_query_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
-        Compute a simple query embedding from token IDs using the shift model's
-        token embeddings (mean-pooled over non-PAD tokens).
+        Compute a query embedding in the SAME space as the domain fingerprints.
+
+        IMPORTANT:
+        This uses the GENERALIST TRUNK encoder (BaseTransformerLM.encode), not the
+        shift model's token embedding table. That makes cosine/Mahalanobis routing
+        geometrically meaningful and consistent with GRCLM.
 
         Args:
             input_ids: Tensor of shape [seq_len] on self.device.
@@ -1068,22 +1114,17 @@ class ModelManager:
         Returns:
             1D tensor of shape [d_model].
         """
-        assert self.shift_model is not None
+        assert self.base_model is not None
         assert self.tokenizer is not None
 
         if input_ids.ndim != 1:
             raise ValueError(f"Expected [seq_len] input_ids, got shape {tuple(input_ids.shape)}")
 
-        # Exclude PAD tokens
-        mask = input_ids != self.tokenizer.pad_id
-        if mask.sum().item() == 0:
-            emb = self.shift_model.tok_emb(input_ids)
-            return emb.mean(dim=0)
+        ids = input_ids.unsqueeze(0)  # [1, S]
+        attn = (ids != self.tokenizer.pad_id).long()
 
-        valid_ids = input_ids[mask]
-        emb = self.shift_model.tok_emb(valid_ids)  # [num_tokens, d_model]
-        q = emb.mean(dim=0)  # [d_model]
-        return q
+        q = self.base_model.encode(ids, attention_mask=attn)  # [1, D]
+        return q.squeeze(0)
 
     def generate(
         self,
@@ -1139,61 +1180,13 @@ class ModelManager:
             and routing_result is not None
             and not routing_result.is_unknown
         ):
-            num_specialists = len(self.specialist_names)
-            num_domains = 1 + num_specialists  # general/base + specialists
-
-            # Map domain names to indices:
-            #   0          -> "general" (base)
-            #   i (>= 1)   -> self.specialist_names[i-1]
-            name_to_idx: Dict[str, int] = {"general": 0}
-            for i, name in enumerate(self.specialist_names, start=1):
-                name_to_idx[name] = i
-
-            # Start with -inf for all domains, then fill known scores
-            scores = torch.full(
-                (num_domains,),
-                float("-inf"),
-                device=self.device,
-            )
-
-            for m in routing_result.metrics:
-                idx = name_to_idx.get(getattr(m, 'domain', None))
-                if idx is not None:
-                    scores[idx] = float(m.score)
-
-            # Ensure the base/general domain is always at least neutral
-            if not torch.isfinite(scores[0]):
-                scores[0] = 0.0
-
-            # Top-K over specialists only (indices 1..num_domains-1)
-            k = getattr(config, "ROUTER_TOP_K_ADVISORS", 3)
-            k = max(0, min(k, num_specialists))
-
-            domain_mask_vec = torch.zeros(
-                num_domains,
-                dtype=torch.float32,
-                device=self.device,
-            )
-            domain_mask_vec[0] = 1.0  # always include base
-
-            if k > 0 and num_specialists > 0:
-                spec_scores = scores[1:]  # [num_specialists]
-                top_vals, top_idx = torch.topk(
-                    spec_scores,
-                    k=min(k, num_specialists),
-                )
-                for v, idx_rel in zip(top_vals, top_idx):
-                    if torch.isfinite(v):
-                        domain_mask_vec[1 + int(idx_rel.item())] = 1.0
-
-            # Build a soft prior only over allowed domains
-            masked_scores = scores.clone()
-            masked_scores[domain_mask_vec == 0] = float("-inf")
-            prior_vec = torch.softmax(masked_scores, dim=0)
+            # Use the GRCLM-style routing policy helper:
+            # softmax (selection probs) -> sigmoid (blend strength) -> learned gate (inside SMA)
+            prior_vec, mask_vec = self._build_domain_prior_from_routing(routing_result)
 
             # Shape to [1, num_domains] so it can be broadcast across batch
             domain_prior = prior_vec.unsqueeze(0)
-            domain_mask = domain_mask_vec.unsqueeze(0)
+            domain_mask = mask_vec.unsqueeze(0)
 
         # ---------------------------------------------------------------------
         # 3) Autoregressive generation, steered by domain_prior/domain_mask

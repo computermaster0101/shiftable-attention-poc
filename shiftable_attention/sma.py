@@ -61,7 +61,7 @@ class ShiftableMultiheadAttention(nn.Module):
         self.base_batch_first = getattr(self.base_mha, "batch_first", False)
 
         # Specialist MHA modules
-        self.specialist_mhas = nn.ModuleList([
+        self.spec_mhas = nn.ModuleList([
             nn.MultiheadAttention(
                 embed_dim=d_model,
                 num_heads=num_heads,

@@ -84,6 +84,46 @@ class BaseTransformerLM(nn.Module):
         logits = self.lm_head(x)
         return logits
 
+    @torch.no_grad()
+    def encode(
+        self,
+        input_ids: torch.Tensor,
+        attention_mask: Optional[torch.Tensor] = None,
+    ) -> torch.Tensor:
+        """
+        Trunk embedding: mean-pooled TransformerEncoder output (not raw tok_emb pooling).
+
+        Args:
+            input_ids: [batch, seq_len]
+            attention_mask: optional [batch, seq_len] with 1 for real tokens and 0 for padding.
+
+        Returns:
+            pooled: [batch, d_model]
+        """
+        self.eval()
+
+        batch_size, seq_len = input_ids.shape
+        device = input_ids.device
+
+        if seq_len > self.max_seq_len:
+            raise ValueError(f"Sequence length {seq_len} exceeds max_seq_len={self.max_seq_len}")
+
+        positions = torch.arange(0, seq_len, device=device).unsqueeze(0).expand(batch_size, seq_len)
+        x = self.tok_emb(input_ids) + self.pos_emb(positions)
+
+        if attention_mask is not None:
+            key_padding_mask = attention_mask == 0
+            valid = attention_mask.float()
+        else:
+            key_padding_mask = input_ids == self.pad_id
+            valid = (input_ids != self.pad_id).float()
+
+        x = self.encoder(x, src_key_padding_mask=key_padding_mask)  # [B,S,D]
+
+        denom = valid.sum(dim=1, keepdim=True).clamp_min(1.0)
+        pooled = (x * valid.unsqueeze(-1)).sum(dim=1) / denom
+        return pooled
+
 
 class ShiftableTransformerLM(nn.Module):
     """
