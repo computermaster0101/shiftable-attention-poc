@@ -1034,6 +1034,114 @@ class ModelManager:
             domain_prior[0] = 1.0
             return domain_prior, domain_mask
 
+
+
+    def _calibrate_domain_weights_with_predictive_entropy(
+        self,
+        input_ids_tensor: torch.Tensor,
+        domain_prior: torch.Tensor,
+        domain_mask: torch.Tensor,
+        domain_weights: Optional[torch.Tensor],
+        temperature: float = 1.0,
+        eta: float = 1.0,
+        lam: float = 1.0,
+        min_conf: float = 0.2,
+        eps: float = 1e-9,
+    ) -> torch.Tensor:
+        """
+        Predictive-entropy calibration for generation-time blending.
+
+        We compute a *confidence* per allowed domain by measuring next-token
+        predictive entropy under an (almost) isolated one-hot domain weighting.
+        Then we reweight the existing blend weights (geometry prior + optional
+        learned correction) as:
+
+            w_final ∝ w_in * conf^lam,  where conf = exp(-eta * H_pred)
+
+        This NEVER changes the selection set; it only rescales within domain_mask.
+        """
+        self.ensure_initialized()
+        assert self.shift_model is not None
+        assert self.tokenizer is not None
+
+        # Shape normalization: expect [1, num_domains]
+        if input_ids_tensor.dim() != 2:
+            raise ValueError(f"input_ids_tensor must be [1,S], got {tuple(input_ids_tensor.shape)}")
+
+        if domain_prior.dim() == 1:
+            domain_prior = domain_prior.unsqueeze(0)
+        if domain_mask.dim() == 1:
+            domain_mask = domain_mask.unsqueeze(0)
+
+        num_domains = int(domain_mask.size(-1))
+
+        # Choose the incoming weights (prefer explicit domain_weights, else the geometric prior)
+        w_in = domain_weights if domain_weights is not None else domain_prior
+        if w_in.dim() == 1:
+            w_in = w_in.unsqueeze(0)
+
+        # Restrict to allowed domains
+        allowed = (domain_mask[0] > 0.0).nonzero(as_tuple=False).view(-1).tolist()
+        if len(allowed) <= 1:
+            return w_in
+
+        # Numerical guards
+        if temperature <= 0:
+            temperature = 1.0
+        min_conf = float(max(0.0, min(1.0, min_conf)))
+        eps = float(max(1e-12, eps))
+
+        # Build an attention mask once
+        attention_mask = (input_ids_tensor != self.tokenizer.pad_id).long()
+
+        conf = torch.ones((num_domains,), device=self.device, dtype=torch.float32)
+
+        self.shift_model.eval()
+        with torch.no_grad():
+            for idx in allowed:
+                # Build a run-specific sparse mask (keep base compute allowed)
+                run_mask = torch.zeros((1, num_domains), device=self.device, dtype=torch.float32)
+                run_mask[0, 0] = 1.0
+                run_mask[0, idx] = 1.0
+
+                # One-hot weighting to isolate the domain contribution
+                run_w = torch.zeros((1, num_domains), device=self.device, dtype=torch.float32)
+                run_w[0, idx] = 1.0
+
+                logits = self.shift_model(
+                    input_ids_tensor,
+                    attention_mask=attention_mask,
+                    domain_prior=domain_prior,
+                    domain_mask=run_mask,
+                    domain_weights=run_w,
+                )
+
+                next_logits = logits[0, -1, :] / temperature
+                logp = torch.log_softmax(next_logits, dim=-1)
+                p = torch.exp(logp)
+                h = -(p * logp).sum()  # scalar entropy
+
+                # Confidence from entropy
+                c = torch.exp(-eta * h).clamp(min=min_conf, max=1.0)
+                conf[idx] = c
+
+        # Combine incoming weights with confidence
+        w = w_in[0].clone()
+        w = w * (conf ** lam)
+
+        # Enforce selection mask and renormalize
+        w = w * domain_mask[0]
+        s = float(w.sum().item())
+        if s > 0:
+            w = w / s
+        else:
+            # fallback uniform over allowed
+            w = domain_mask[0] / float(len(allowed))
+
+        return w.unsqueeze(0)
+
+
+
         # Softmax over specialist scores for selection (ignore -inf -> prob 0)
         spec_scores = scores[1:].clone()
         # Temperature scaling (avoid divide-by-zero)
@@ -1212,6 +1320,36 @@ class ModelManager:
                 # If anything goes wrong, fall back to prior-driven per-layer gate
                 domain_weights = None
 
+
+        # ---------------------------------------------------------------------
+        # 2b) Optional: predictive-entropy calibration of domain_weights
+        # ---------------------------------------------------------------------
+        # Geometry decides *which* domains are allowed (domain_mask) and provides
+        # the prior (domain_prior). Predictive entropy then reweights only the
+        # allowed domains based on next-token confidence, without overriding the
+        # geometric selection itself.
+        if (
+            domain_mask is not None
+            and domain_prior is not None
+            and int(torch.count_nonzero(domain_mask).item()) > 1
+            and bool(getattr(config, "USE_PREDICTIVE_ENTROPY", True))
+        ):
+            try:
+                domain_weights = self._calibrate_domain_weights_with_predictive_entropy(
+                    input_ids_tensor=input_ids_tensor,
+                    domain_prior=domain_prior,
+                    domain_mask=domain_mask,
+                    domain_weights=domain_weights,
+                    temperature=float(getattr(config, "PRED_ENTROPY_TEMPERATURE", 1.0) or 1.0),
+                    eta=float(getattr(config, "PRED_ENTROPY_ETA", 1.0) or 1.0),
+                    lam=float(getattr(config, "PRED_ENTROPY_LAMBDA", 1.0) or 1.0),
+                    min_conf=float(getattr(config, "PRED_ENTROPY_MIN_CONF", 0.2) or 0.2),
+                    eps=float(getattr(config, "PRED_ENTROPY_EPS", 1e-9) or 1e-9),
+                )
+            except Exception:
+                # Any failure should never break generation; fall back to geometry-only weights.
+                pass
+
         # ---------------------------------------------------------------------
         # 3) Autoregressive generation, steered by domain_prior/domain_mask
         # ---------------------------------------------------------------------
@@ -1265,7 +1403,6 @@ class ModelManager:
         full_text = self.tokenizer.decode(generated_ids, skip_specials=True)
         completion_ids = generated_ids[len(input_ids) :]
         completion_text = self.tokenizer.decode(completion_ids, skip_specials=True)
-
 
         # -----------------------------------------------------------------
         # 3.5) Low-confidence / unknown-domain response policy
