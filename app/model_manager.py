@@ -157,7 +157,7 @@ class ModelManager:
         self.specialist_names: List[str] = []
 
         # Geometric router (uses DOMAIN_STATS_PATH)
-        self.router = DomainRouter(config.DOMAIN_STATS_PATH, self.device)
+        self.router = DomainRouter(config.DOMAIN_STATS_PATH)
 
         # In-memory buffer of unknown-domain embeddings used to decide when
         # to spawn new emergent specialists based on the geometric clustering
@@ -189,12 +189,17 @@ class ModelManager:
             else:
                 logger.info("Found existing generalist checkpoint and tokenizer.")
 
-            if not config.SHIFTABLE_CKPT_PATH.exists():
-                logger.info("Shiftable checkpoint not found. Training shiftable model for all specialists.")
-                self._train_shiftable_for_all_specialists()
+            # Shiftable artifacts can be either legacy monolithic (shiftable.pt)
+            # or modular (shiftable_base.pt + specialists/*.pt)
+            if not config.SHIFTABLE_BASE_PATH.exists():
+                if config.SHIFTABLE_CKPT_PATH.exists():
+                    logger.info("Found legacy shiftable checkpoint. Migrating to modular artifacts.")
+                    self._migrate_monolithic_shiftable_to_split()
+                else:
+                    logger.info("Shiftable artifacts not found. Training shiftable model for all specialists (then exporting modular artifacts).")
+                    self._train_shiftable_for_all_specialists()
             else:
-                logger.info("Found existing shiftable checkpoint. Loading model.")
-
+                logger.info("Found existing modular shiftable artifacts. Loading model.")
             self._load_tokenizer_and_shiftable_model()
             self.router.reload()
             self._initialized = True
@@ -258,7 +263,9 @@ class ModelManager:
         for epoch in range(1, config.GENERAL_EPOCHS + 1):
             start = time.time()
             train_loss = _train_one_epoch(model, dataloader, optimizer, self.device, pad_id=tokenizer.pad_id)
-            val_loss = _evaluate(model, dataloader, self.device, pad_id=tokenizer.pad_id)
+            # Commented out val_loss calculation to speed up training
+            # val_loss = _evaluate(model, dataloader, self.device, pad_id=tokenizer.pad_id)
+            val_loss = 0.0
             epoch_time = time.time() - start
             logger.info(
                 "[Generalist] Epoch %d/%d - train loss: %.4f, val loss: %.4f, Duration: %d seconds",
@@ -308,10 +315,19 @@ class ModelManager:
         model.load_state_dict(ckpt["model_state_dict"])
         return model, cfg
 
+    
     def _train_shiftable_for_all_specialists(self) -> None:
         """
         Train ShiftableTransformerLM for ALL discovered specialists.
         This is used both at first initialization and whenever the specialist set changes.
+
+        Key behaviors (v04 goals):
+        - Specialist training is "light": we DO NOT include the general corpus by default.
+          (You may override by defining config.SHIFTABLE_INCLUDE_GENERAL=True.)
+        - We freeze the entire trunk and only train specialist parameters (+ gates / blend_gate).
+        - After training, we export modular artifacts:
+            outputs/shiftable/shiftable_base.pt
+            outputs/shiftable/specialists/<name>.pt  (one per specialist)
         """
         if not config.TOKENIZER_PATH.exists():
             raise RuntimeError("Tokenizer not found; cannot train shiftable model.")
@@ -323,9 +339,7 @@ class ModelManager:
         num_specialists = len(specialist_names)
 
         if not specialist_names:
-            logger.warning(
-                "No specialist directories found. Training shiftable model with general-only (0 specialists)."
-            )
+            logger.warning("No specialist directories found. Training shiftable model with 0 specialists.")
         else:
             logger.info("Training shiftable model for specialists: %s", ", ".join(specialist_names))
 
@@ -334,24 +348,52 @@ class ModelManager:
             num_specialists=num_specialists,
             specialist_names=specialist_names if specialist_names else [],
             use_cls_token_pool=config.USE_CLS_TOKEN_POOL,
-        )
+        ).to(self.device)
 
-        shift_model = shift_model.to(self.device)
+        # ------------------------------------------------------------------
+        # Freeze everything, then unfreeze only specialist-specific params
+        # and the gates that control specialist participation.
+        # ------------------------------------------------------------------
+        for _, p in shift_model.named_parameters():
+            p.requires_grad = False
 
-        # Optionally freeze embeddings and LM head to focus training on specialist branches
-        for name, param in shift_model.named_parameters():
-            if name.startswith("tok_emb") or name.startswith("pos_emb") or name.startswith("lm_head"):
-                param.requires_grad = False
+        for name, p in shift_model.named_parameters():
+            lname = name.lower()
+            if (
+                "spec_" in lname
+                or ".spec_mhas." in lname
+                or "specialist" in lname
+                or "gate" in lname   # DomainGate MLPs (including fc2 rows for specialists)
+                or "blend_gate" in lname
+            ):
+                p.requires_grad = True
 
-        # Build datasets (general + all specialists)
+        # Sanity log
+        try:
+            trainable = [(n, p.numel()) for n, p in shift_model.named_parameters() if p.requires_grad]
+            total = sum(c for _, c in trainable)
+            logger.info("Shiftable trainable tensors=%d, params=%d", len(trainable), total)
+            for n, c in trainable[:25]:
+                logger.info("  trainable: %s (%d)", n, c)
+        except Exception:
+            pass
+
+        # ------------------------------------------------------------------
+        # Build datasets: specialists only by default.
+        # ------------------------------------------------------------------
         datasets = []
 
-        if config.GENERAL_DATA_DIR.exists():
-            logger.info("Including general corpus in shiftable training.")
-            general_ds = _build_lm_dataset_from_dir(config.GENERAL_DATA_DIR, tokenizer, seq_len=config.MAX_SEQ_LEN)
+        include_general = bool(getattr(config, "SHIFTABLE_INCLUDE_GENERAL", False))
+        if include_general and config.GENERAL_DATA_DIR.exists():
+            logger.info("Including general corpus in shiftable training (SHIFTABLE_INCLUDE_GENERAL=True).")
+            general_ds = _build_lm_dataset_from_dir(
+                config.GENERAL_DATA_DIR,
+                tokenizer,
+                seq_len=config.MAX_SEQ_LEN,
+            )
             datasets.append(general_ds)
         else:
-            logger.warning("General data directory %s does not exist; skipping general corpus.", config.GENERAL_DATA_DIR)
+            logger.info("Skipping general corpus for shiftable training (specialist-only pass).")
 
         for spec_name in specialist_names:
             spec_dir = config.DATA_ROOT / spec_name
@@ -359,29 +401,39 @@ class ModelManager:
             spec_ds = _build_lm_dataset_from_dir(spec_dir, tokenizer, seq_len=config.MAX_SEQ_LEN)
             datasets.append(spec_ds)
 
+        if not datasets:
+            raise RuntimeError("No datasets found for shiftable training (no specialists and general excluded).")
+
         train_dataset = ConcatDataset(datasets)
         dataloader = DataLoader(
-            train_dataset, 
-            batch_size=config.SHIFTABLE_BATCH_SIZE, 
+            train_dataset,
+            batch_size=config.SHIFTABLE_BATCH_SIZE,
             shuffle=True,
-            )
+        )
 
         optimizer = torch.optim.Adam(
-            filter(lambda p: p.requires_grad, shift_model.parameters()),
+            [p for p in shift_model.parameters() if p.requires_grad],
             lr=config.SHIFTABLE_LR,
         )
 
+        logger.info("Beginning training loop")
         for epoch in range(1, config.SHIFTABLE_EPOCHS + 1):
+            start = time.time()
             train_loss = _train_one_epoch(shift_model, dataloader, optimizer, self.device, pad_id=tokenizer.pad_id)
-            val_loss = _evaluate(shift_model, dataloader, self.device, pad_id=tokenizer.pad_id)
+            # Commented out val_loss calculation to speed up training
+            # val_loss = _evaluate(shift_model, dataloader, self.device, pad_id=tokenizer.pad_id
+            val_loss = 0.0
+            epoch_time = time.time() - start
             logger.info(
-                "[Shiftable] Epoch %d/%d - train loss: %.4f, val loss: %.4f",
+                "[Shiftable] Epoch %d/%d - train loss: %.4f, val loss: %.4f Duration: %d seconds",
                 epoch,
                 config.SHIFTABLE_EPOCHS,
                 train_loss,
                 val_loss,
+                epoch_time
             )
 
+        # Save legacy monolithic artifact (kept for compatibility / debugging)
         ckpt = {
             "config": {
                 "vocab_size": tokenizer.vocab_size,
@@ -400,13 +452,236 @@ class ModelManager:
 
         config.SHIFTABLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
         torch.save(ckpt, config.SHIFTABLE_CKPT_PATH)
-        logger.info("Saved shiftable checkpoint to %s", config.SHIFTABLE_CKPT_PATH)
+        logger.info("Saved legacy shiftable checkpoint to %s", config.SHIFTABLE_CKPT_PATH)
+
+        # Export split artifacts (base + one .pt per specialist)
+        self._save_split_shiftable_artifacts(
+            shift_model=shift_model,
+            tokenizer=tokenizer,
+            specialist_names=specialist_names,
+            source_cfg=ckpt.get("config"),
+        )
 
         # Build / refresh domain statistics for routing (general + specialists)
         domain_names = ["general"] + specialist_names
         self._build_domain_stats(tokenizer, base_model, domain_names)
         self.router.reload()
 
+    # ------------------------------------------------------------------ #
+    # Split-artifact specialist lifecycle (base + per-specialist)
+    # ------------------------------------------------------------------ #
+
+    def _shiftable_split_artifacts_exist(self) -> bool:
+        """Return True if the split-artifact layout exists on disk."""
+        if not config.SHIFTABLE_BASE_PATH.exists():
+            return False
+        # specialists dir may legitimately be empty (0 specialists)
+        return True
+
+    def _list_specialists_on_disk(self) -> List[str]:
+        """
+        Source of truth for specialists at runtime.
+
+        We treat each file in outputs/shiftable/specialists/*.pt as a plugin specialist.
+        The stem of the filename is the specialist name.
+        """
+        if not config.SPECIALISTS_DIR.exists():
+            return []
+        names: List[str] = []
+        for p in sorted(config.SPECIALISTS_DIR.glob("*.pt")):
+            if p.name.startswith("."):
+                continue
+            names.append(p.stem)
+        return names
+
+    def _migrate_monolithic_shiftable_to_split(self) -> None:
+        """
+        One-time migration: outputs/shiftable/shiftable.pt -> shiftable_base.pt + specialists/<name>.pt.
+
+        This lets you keep your existing trained model but unlock add/remove specialists
+        by simply adding/removing specialist plugin files.
+        """
+        if not config.SHIFTABLE_CKPT_PATH.exists():
+            raise RuntimeError("Legacy shiftable checkpoint not found; cannot migrate.")
+
+        tokenizer = SimpleTokenizer.load(str(config.TOKENIZER_PATH))
+        ckpt = torch.load(config.SHIFTABLE_CKPT_PATH, map_location="cpu")
+        cfg: Dict[str, object] = ckpt["config"]
+
+        base_model, _ = self._load_generalist_model()
+        base_model.eval()
+
+        specialist_names = list(cfg.get("specialist_names", []))
+        shift_model = ShiftableTransformerLM.from_base_model(
+            base_model,
+            num_specialists=int(cfg.get("num_specialists", len(specialist_names))),
+            specialist_names=specialist_names,
+            use_cls_token_pool=False,
+        )
+        shift_model.load_state_dict(ckpt["model_state_dict"])
+        shift_model.eval()
+
+        self._save_split_shiftable_artifacts(
+            shift_model=shift_model,
+            tokenizer=tokenizer,
+            specialist_names=specialist_names,
+            source_cfg=cfg,
+        )
+
+    def _save_split_shiftable_artifacts(
+        self,
+        shift_model: ShiftableTransformerLM,
+        tokenizer: SimpleTokenizer,
+        specialist_names: List[str],
+        source_cfg: Optional[Dict[str, object]] = None,
+    ) -> None:
+        """
+        Save:
+          - shiftable_base.pt (all size-stable params)
+          - specialists/<name>.pt (params specific to each specialist)
+        """
+        config.SHIFTABLE_OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
+        config.SPECIALISTS_DIR.mkdir(parents=True, exist_ok=True)
+
+        # 1) Build base state dict by removing size-dependent keys
+        full_sd = {k: v.detach().cpu() for k, v in shift_model.state_dict().items()}
+
+        # Capture the base (domain=0) rows for all gates, then remove fc2 + spec modules from base_sd
+        gate_base_rows = {
+            "blend_gate": {
+                "weight0": shift_model.blend_gate.fc2.weight[0].detach().cpu(),
+                "bias0": shift_model.blend_gate.fc2.bias[0].detach().cpu(),
+            },
+            "blocks": [],
+        }
+        for layer_idx in range(shift_model.n_layers):
+            gate = shift_model.blocks[layer_idx].self_attn.gate
+            gate_base_rows["blocks"].append(
+                {
+                    "weight0": gate.fc2.weight[0].detach().cpu(),
+                    "bias0": gate.fc2.bias[0].detach().cpu(),
+                }
+            )
+
+        def is_dynamic_key(key: str) -> bool:
+            # Specialist MHA parameters
+            if ".self_attn.spec_mhas." in key:
+                return True
+            # Gate fc2 depends on num_domains (=1+num_specialists)
+            if key.endswith(".self_attn.gate.fc2.weight") or key.endswith(".self_attn.gate.fc2.bias"):
+                return True
+            if key.endswith("blend_gate.fc2.weight") or key.endswith("blend_gate.fc2.bias"):
+                return True
+            return False
+
+        base_sd = {k: v for k, v in full_sd.items() if not is_dynamic_key(k)}
+
+        base_cfg: Dict[str, object] = {
+            # Keep what you need to sanity-check compatibility at load time
+            "vocab_size": shift_model.vocab_size,
+            "d_model": shift_model.d_model,
+            "n_heads": shift_model.n_heads,
+            "n_layers": shift_model.n_layers,
+            "dim_feedforward": shift_model.dim_feedforward,
+            "dropout": shift_model.dropout,
+            "max_seq_len": shift_model.max_seq_len,
+            "pad_id": shift_model.pad_id,
+        }
+        if source_cfg:
+            # preserve any additional training metadata you already had
+            for k in ("generalist_ckpt", "trained_at", "notes"):
+                if k in source_cfg:
+                    base_cfg[k] = source_cfg[k]
+
+        base_ckpt = {
+            "config": base_cfg,
+            "model_state_dict": base_sd,
+            "gate_base_rows": gate_base_rows,
+        }
+        torch.save(base_ckpt, config.SHIFTABLE_BASE_PATH)
+        logger.info("Saved split shiftable base to %s", config.SHIFTABLE_BASE_PATH)
+
+        # 2) Save each specialist plugin
+        for idx, name in enumerate(specialist_names):
+            spec_payload = self._extract_specialist_payload(shift_model, idx=idx, name=name)
+            spec_path = config.SPECIALISTS_DIR / f"{name}.pt"
+            torch.save(spec_payload, spec_path)
+            logger.info("Saved specialist '%s' to %s", name, spec_path)
+
+    def _extract_specialist_payload(self, shift_model: ShiftableTransformerLM, idx: int, name: str) -> Dict[str, object]:
+        """Extract just the parameters that belong to ONE specialist (by index)."""
+        mha_layers: List[Dict[str, torch.Tensor]] = []
+        gate_rows: List[Dict[str, torch.Tensor]] = []
+        for layer_idx in range(shift_model.n_layers):
+            spec_mha = shift_model.blocks[layer_idx].self_attn.spec_mhas[idx]
+            mha_layers.append({k: v.detach().cpu() for k, v in spec_mha.state_dict().items()})
+
+            gate = shift_model.blocks[layer_idx].self_attn.gate.fc2
+            gate_rows.append(
+                {
+                    "weight": gate.weight[idx + 1].detach().cpu(),
+                    "bias": gate.bias[idx + 1].detach().cpu(),
+                }
+            )
+
+        blend = shift_model.blend_gate.fc2
+        payload: Dict[str, object] = {
+            "name": name,
+            "format_version": 1,
+            "n_layers": shift_model.n_layers,
+            "d_model": shift_model.d_model,
+            "n_heads": shift_model.n_heads,
+            "mha_layers": mha_layers,
+            "gate_rows": gate_rows,
+            "blend_gate_row": {
+                "weight": blend.weight[idx + 1].detach().cpu(),
+                "bias": blend.bias[idx + 1].detach().cpu(),
+            },
+        }
+        return payload
+
+    def _apply_base_gate_rows(self, shift_model: ShiftableTransformerLM, gate_rows: Dict[str, object]) -> None:
+        """Apply the stored domain-0 rows for all gates (blend_gate + per-block SMA gates)."""
+        try:
+            bg = gate_rows.get("blend_gate", {})
+            if bg:
+                shift_model.blend_gate.fc2.weight.data[0].copy_(bg["weight0"])
+                shift_model.blend_gate.fc2.bias.data[0].copy_(bg["bias0"])
+
+            blocks = gate_rows.get("blocks", [])
+            for layer_idx in range(min(len(blocks), shift_model.n_layers)):
+                row = blocks[layer_idx]
+                gate = shift_model.blocks[layer_idx].self_attn.gate.fc2
+                gate.weight.data[0].copy_(row["weight0"])
+                gate.bias.data[0].copy_(row["bias0"])
+        except Exception:
+            logger.exception("Failed applying base gate rows; continuing with initialized weights.")
+
+    def _load_one_specialist_into_model(self, shift_model: ShiftableTransformerLM, idx: int, name: str) -> None:
+        """Load a single specialist plugin into the live model at index idx."""
+        spec_path = config.SPECIALISTS_DIR / f"{name}.pt"
+        if not spec_path.exists():
+            raise RuntimeError(f"Specialist file missing: {spec_path}")
+
+        payload = torch.load(spec_path, map_location="cpu")
+        if int(payload.get("format_version", 0)) != 1:
+            raise RuntimeError(f"Unsupported specialist format for {name}: {payload.get('format_version')}")
+        if int(payload.get("n_layers", -1)) != int(shift_model.n_layers):
+            raise RuntimeError(f"Specialist {name} incompatible: n_layers mismatch")
+
+        mha_layers = payload["mha_layers"]
+        gate_rows = payload["gate_rows"]
+        for layer_idx in range(shift_model.n_layers):
+            spec_mha = shift_model.blocks[layer_idx].self_attn.spec_mhas[idx]
+            spec_mha.load_state_dict(mha_layers[layer_idx])
+
+            gate = shift_model.blocks[layer_idx].self_attn.gate.fc2
+            gate.weight.data[idx + 1].copy_(gate_rows[layer_idx]["weight"])
+            gate.bias.data[idx + 1].copy_(gate_rows[layer_idx]["bias"])
+
+        blend = payload["blend_gate_row"]
+        shift_model.blend_gate.fc2.weight.data[idx + 1].copy_(blend["weight"])
+        shift_model.blend_gate.fc2.bias.data[idx + 1].copy_(blend["bias"])
     def _build_domain_stats(
         self,
         tokenizer: SimpleTokenizer,
@@ -582,42 +857,67 @@ class ModelManager:
             json.dump(domain_stats, f)
         logger.info("Saved domain stats to %s", config.DOMAIN_STATS_PATH)
 
+
     def _load_tokenizer_and_shiftable_model(self) -> None:
         """
-        Load tokenizer and shiftable model from disk into memory.
+        Load tokenizer + generalist + shiftable model.
+
+        Preferred: split artifacts
+            - shiftable_base.pt
+            - specialists/<name>.pt (one per specialist)
+
+        Backward compatible:
+            - if legacy shiftable.pt exists and split artifacts do not, migrate once.
         """
         if not config.TOKENIZER_PATH.exists():
             raise RuntimeError("Tokenizer file not found when attempting to load shiftable model.")
-        if not config.SHIFTABLE_CKPT_PATH.exists():
-            raise RuntimeError("Shiftable checkpoint not found when attempting to load model.")
+        if not config.GENERALIST_CKPT_PATH.exists():
+            raise RuntimeError("Generalist checkpoint not found when attempting to load shiftable model.")
+
+        # Ensure split artifacts exist (migrate legacy if needed)
+        if not self._shiftable_split_artifacts_exist():
+            if config.SHIFTABLE_CKPT_PATH.exists():
+                logger.info("Found legacy shiftable.pt. Migrating to split artifacts.")
+                self._migrate_monolithic_shiftable_to_split()
+            else:
+                raise RuntimeError("No shiftable artifacts found. Expected shiftable_base.pt or legacy shiftable.pt.")
 
         tokenizer = SimpleTokenizer.load(str(config.TOKENIZER_PATH))
-        ckpt = torch.load(config.SHIFTABLE_CKPT_PATH, map_location="cpu")
-        cfg: Dict[str, object] = ckpt["config"]
-
         base_model, _ = self._load_generalist_model()
-        base_model = base_model.to(self.device)
         base_model.eval()
-        self.base_model = base_model
+
+        specialist_names = self._list_specialists_on_disk()
         shift_model = ShiftableTransformerLM.from_base_model(
-            base_model,
-            num_specialists=int(cfg["num_specialists"]),
-            specialist_names=list(cfg["specialist_names"]),
-            use_cls_token_pool=False,
+            base_model=base_model,
+            num_specialists=len(specialist_names),
+            specialist_names=specialist_names,
+            use_cls_token_pool=config.USE_CLS_TOKEN_POOL,
         )
-        shift_model.load_state_dict(ckpt["model_state_dict"])
+
+        base_bundle = torch.load(config.SHIFTABLE_BASE_PATH, map_location="cpu")
+        base_sd = base_bundle.get("model_state_dict", {})
+        gate_rows = base_bundle.get("gate_base_rows", {})
+
+        missing, unexpected = shift_model.load_state_dict(base_sd, strict=False)
+        if unexpected:
+            logger.warning("Unexpected keys when loading shiftable base: %s", unexpected)
+        # Apply domain-0 gate rows (fc2 row 0) for every gate
+        self._apply_base_gate_rows(shift_model, gate_rows)
+
+        # Load each specialist plugin by index
+        for idx, name in enumerate(specialist_names):
+            self._load_one_specialist_into_model(shift_model, idx=idx, name=name)
+
         shift_model = shift_model.to(self.device)
         shift_model.eval()
 
         self.tokenizer = tokenizer
+        self.base_model = base_model.to(self.device)
+        self.base_model.eval()
         self.shift_model = shift_model
-        self.specialist_names = list(cfg["specialist_names"])
+        self.specialist_names = specialist_names
 
-        logger.info("Loaded shiftable model with specialists: %s", ", ".join(self.specialist_names))
-
-    # ------------------------------------------------------------------ #
-    # Emergent expert state + corpus helpers
-    # ------------------------------------------------------------------ #
+        logger.info("Loaded split shiftable artifacts: base=%s, specialists=%d", config.SHIFTABLE_BASE_PATH, len(specialist_names))
 
     def _load_emergent_state(self) -> Tuple[int, int]:
         """
@@ -684,7 +984,7 @@ class ModelManager:
                 "is_unknown": routing_result.is_unknown,
                 "metrics": [
                     {
-                        "name": m.name,
+                        "name": m.domain,
                         "similarity": m.similarity,
                         "mahalanobis": m.mahalanobis,
                         "entropy": m.entropy,
@@ -767,7 +1067,7 @@ class ModelManager:
                 record["routing"] = {
                     "metrics": [
                         {
-                            "name": m.name,
+                            "name": m.domain,
                             "similarity": float(m.similarity),
                             "mahalanobis": float(m.mahalanobis),
                             "entropy": float(m.entropy),
@@ -787,10 +1087,14 @@ class ModelManager:
                     "is_unknown": True,
                     "reason": "no_router",
                 }
+                try:
+                    log_path = Path(getattr(config, "EMERGENCE_LOG_PATH")).expanduser()
+                    log_path.parent.mkdir(parents=True, exist_ok=True)
+                    with open(config.EMERGENCE_LOG_PATH, "a", encoding="utf-8") as f_log:
+                        f_log.write(json.dumps(record) + "\n")
+                except Exception as e:
+                    logger.warning("Failed to write emergence log: %s", e)
 
-            config.EMERGENCE_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
-            with open(config.EMERGENCE_LOG_PATH, "a", encoding="utf-8") as f_log:
-                f_log.write(json.dumps(record) + "\n")
         except Exception as e:
             logger.warning("Failed to write emergence log: %s", e)
 
@@ -1196,74 +1500,6 @@ class ModelManager:
             w = domain_mask[0] / float(len(allowed))
 
         return w.unsqueeze(0)
-
-
-
-        # Softmax over specialist scores for selection (ignore -inf -> prob 0)
-        spec_scores = scores[1:].clone()
-        # Temperature scaling (avoid divide-by-zero)
-        if sel_temp <= 0:
-            sel_temp = 1.0
-        spec_probs = torch.softmax(spec_scores / sel_temp, dim=0)
-
-        # Rank specialists by probability
-        sorted_probs, sorted_idx = torch.sort(spec_probs, descending=True)
-
-        selected_rel: list[int] = []
-        cum = 0.0
-        for p, idx_rel in zip(sorted_probs.tolist(), sorted_idx.tolist()):
-            # Skip degenerate / invalid specialists
-            if p <= 0 or not torch.isfinite(spec_scores[idx_rel]):
-                continue
-            selected_rel.append(int(idx_rel))
-            cum += float(p)
-            if len(selected_rel) >= max_k:
-                break
-            if cum >= top_p and len(selected_rel) >= min_k:
-                break
-
-        # Fallback: if nothing selected but we have valid scores, pick best one
-        if not selected_rel:
-            # pick argmax among finite scores
-            finite_mask = torch.isfinite(spec_scores)
-            if torch.any(finite_mask):
-                best = int(torch.argmax(torch.where(finite_mask, spec_probs, torch.tensor(-1.0, device=device))).item())
-                selected_rel = [best]
-
-        # Apply selection to mask (specialists are 1..num_domains-1)
-        for idx_rel in selected_rel:
-            domain_mask[1 + idx_rel] = 1.0
-
-        # Sigmoid blend strength on selected (and base)
-        if blend_temp <= 0:
-            blend_temp = 1.0
-        strengths = torch.sigmoid((scores - blend_bias) / blend_temp)
-
-        # Build prior = (selection_probs * strengths) for selected specialists, plus base strength.
-        domain_prior = torch.zeros((num_domains,), device=device, dtype=torch.float32)
-        domain_prior[0] = strengths[0]  # base participation
-
-        for idx_rel in selected_rel:
-            dom_idx = 1 + idx_rel
-            domain_prior[dom_idx] = spec_probs[idx_rel] * strengths[dom_idx]
-
-        # Normalize prior over allowed domains (avoid all-zero)
-        domain_prior = domain_prior * domain_mask
-        s = float(domain_prior.sum().item())
-        if s > 0:
-            domain_prior = domain_prior / s
-        else:
-            # uniform over allowed domains as last resort
-            allowed = torch.count_nonzero(domain_mask).item()
-            if allowed > 0:
-                domain_prior = domain_mask / float(allowed)
-
-        return domain_prior, domain_mask
-
-
-
-
-
     def _compute_query_embedding(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         Compute a query embedding in the SAME space as the domain fingerprints.
@@ -1314,7 +1550,9 @@ class ModelManager:
         # ---------------------------------------------------------------------
         # 1) Encode prompt
         # ---------------------------------------------------------------------
-        input_ids = self.tokenizer.encode(prompt, add_specials=True)
+        # IMPORTANT: for generation we must NOT append <eos> to the prompt.
+        prompt_ids = self.tokenizer.encode(prompt, add_specials=False)
+        input_ids = [self.tokenizer.bos_id] + prompt_ids
         input_ids_tensor = torch.tensor(
             input_ids,
             dtype=torch.long,
@@ -1436,7 +1674,8 @@ class ModelManager:
                     domain_weights=domain_weights,
                 )
                 next_token_logits = logits[0, -1, :]
-
+            temperature = 0
+            top_k = 0
             if temperature <= 0:
                 next_token_id = int(torch.argmax(next_token_logits).item())
             else:

@@ -171,6 +171,22 @@ class ShiftableMultiheadAttention(nn.Module):
 
         return selected_indices, outs
 
+    # -----------------------------
+    # Modular checkpoint helpers
+    # -----------------------------
+
+    def export_specialist_state(self, specialist_index: int) -> dict:
+        """Return a CPU state_dict for a single specialist MHA branch."""
+        if specialist_index < 0 or specialist_index >= len(self.spec_mhas):
+            raise IndexError(f"specialist_index out of range: {specialist_index}")
+        return {k: v.detach().cpu().clone() for k, v in self.spec_mhas[specialist_index].state_dict().items()}
+
+    def load_specialist_state(self, specialist_index: int, state: dict, *, strict: bool = True) -> None:
+        """Load a specialist MHA branch state_dict (from modular .pt)."""
+        if specialist_index < 0 or specialist_index >= len(self.spec_mhas):
+            raise IndexError(f"specialist_index out of range: {specialist_index}")
+        self.spec_mhas[specialist_index].load_state_dict(state, strict=strict)
+
     def forward(
             self,
             x: torch.Tensor,

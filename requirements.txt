@@ -1,0 +1,12 @@
+# Core runtime
+torch>=2.0,<3.0
+fastapi>=0.100,<1.0
+uvicorn[standard]>=0.22,<1.0
+
+# Data + utilities
+numpy>=1.23,<3.0
+tqdm>=4.65,<5.0
+requests>=2.31,<3.0
+
+# Optional but used in code paths
+pydantic>=1.10,<3.0
