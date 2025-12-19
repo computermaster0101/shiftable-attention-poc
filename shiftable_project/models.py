@@ -81,7 +81,10 @@ class BaseTransformerLM(nn.Module):
         else:
             key_padding_mask = input_ids == self.pad_id
 
-        x = self.encoder(x, src_key_padding_mask=key_padding_mask)
+        # Causal mask so token t cannot attend to tokens > t (autoregressive LM training/generation)
+        causal_mask = torch.triu(torch.ones(seq_len, seq_len, device=device), diagonal=1).bool()
+        x = self.encoder(x, mask=causal_mask, src_key_padding_mask=key_padding_mask)
+        
         logits = self.lm_head(x)
         return logits
 

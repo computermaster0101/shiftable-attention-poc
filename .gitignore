@@ -3,3 +3,5 @@
 .venv
 __pycache__
 logs/
+shiftable_project/data/
+shiftable_project/outputs/

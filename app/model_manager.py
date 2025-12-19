@@ -95,18 +95,21 @@ def _evaluate(
 
 
 def _discover_specialist_names() -> List[str]:
-    """
-    Any directory under shiftable_project/data/ that is not 'general'
-    is treated as a specialist corpus.
-    """
-    names: List[str] = []
+    ignore = {"general", "shiftable", "outputs", "__pycache__"}
+    names = []
     data_root = config.DATA_ROOT
     if not data_root.exists():
         return names
 
     for child in data_root.iterdir():
-        if child.is_dir() and child.name != "general":
-            names.append(child.name)
+        if not child.is_dir():
+            continue
+        if child.name in ignore or child.name.startswith("."):
+            continue
+        # only treat as specialist if it actually has txt files
+        if not list_text_files(str(child)):
+            continue
+        names.append(child.name)
 
     names.sort()
     return names
@@ -264,8 +267,8 @@ class ModelManager:
             start = time.time()
             train_loss = _train_one_epoch(model, dataloader, optimizer, self.device, pad_id=tokenizer.pad_id)
             # Commented out val_loss calculation to speed up training
-            # val_loss = _evaluate(model, dataloader, self.device, pad_id=tokenizer.pad_id)
-            val_loss = 0.0
+            val_loss = _evaluate(model, dataloader, self.device, pad_id=tokenizer.pad_id)
+            # val_loss = 0.0
             epoch_time = time.time() - start
             logger.info(
                 "[Generalist] Epoch %d/%d - train loss: %.4f, val loss: %.4f, Duration: %d seconds",
@@ -421,8 +424,8 @@ class ModelManager:
             start = time.time()
             train_loss = _train_one_epoch(shift_model, dataloader, optimizer, self.device, pad_id=tokenizer.pad_id)
             # Commented out val_loss calculation to speed up training
-            # val_loss = _evaluate(shift_model, dataloader, self.device, pad_id=tokenizer.pad_id
-            val_loss = 0.0
+            val_loss = _evaluate(shift_model, dataloader, self.device, pad_id=tokenizer.pad_id)
+            # val_loss = 0.0
             epoch_time = time.time() - start
             logger.info(
                 "[Shiftable] Epoch %d/%d - train loss: %.4f, val loss: %.4f Duration: %d seconds",
@@ -1674,8 +1677,7 @@ class ModelManager:
                     domain_weights=domain_weights,
                 )
                 next_token_logits = logits[0, -1, :]
-            temperature = 0
-            top_k = 0
+
             if temperature <= 0:
                 next_token_id = int(torch.argmax(next_token_logits).item())
             else:
